@@ -1,363 +1,393 @@
 // services/PDFService.ts
 import * as Print from 'expo-print';
+import * as Sharing from 'expo-sharing';
 import * as FileSystem from 'expo-file-system';
-import { WeeklyReport, MonthlyReport } from '@/types/Report';
+import * as MediaLibrary from 'expo-media-library';
+import { Alert, Platform } from 'react-native';
+import { WeeklyReport, MonthlyReport, DailyReport, BookSale } from '@/types/Report';
 import { DataService } from './DataService';
 
-/**
- * PDFService - generates printable A4 HTML -> PDF using expo-print,
- * moves to FileSystem.documentDirectory/reports/ and returns the file URI.
- *
- * Backwards-compatible API:
- * - generateWeeklyPDF(weeklyReport): Promise<string>  // returns saved file URI (same as original)
- * - generateMonthlyPDF(monthlyReport): Promise<string>
- *
- * Advanced API (new):
- * - generateWeeklyPDFAdvanced(weeklyReport, opts): Promise<{ uri?: string; base64?: string }>
- * - generateMonthlyPDFAdvanced(monthlyReport, opts): Promise<{ uri?: string; base64?: string }>
- *
- * Advanced options:
- *  - returnBase64?: boolean  -> if true, returns base64 content instead of saving file
- *  - logoPath?: string       -> optional image URL or file:// URI to include in the HTML
- */
-
-const REPORTS_DIR = `${FileSystem.documentDirectory}reports/`;
-
 export class PDFService {
-  /* ------------------ Backwards-compatible methods ------------------ */
-
-  // original-style: returns URI string (throws on failure)
-  static async generateWeeklyPDF(weeklyReport: WeeklyReport): Promise<string> {
-    const res = await this.generateWeeklyPDFAdvanced(weeklyReport, { returnBase64: false });
-    if (!res.uri) throw new Error('Failed to generate weekly PDF (no uri returned)');
-    return res.uri;
+  // ---------- Public entry points ----------
+  static async generateWeeklyPDF(weeklyReport: WeeklyReport): Promise<void> {
+    return this._generateAndSavePdf({
+      html: this.generateWeeklyHTML(weeklyReport),
+      defaultFileName: `DODOMA_CTF_Week_${weeklyReport.weekNumber}_${this._safeDateStr(weeklyReport.weekStartDate)}.pdf`,
+    });
   }
 
-  static async generateMonthlyPDF(monthlyReport: MonthlyReport): Promise<string> {
-    const res = await this.generateMonthlyPDFAdvanced(monthlyReport, { returnBase64: false });
-    if (!res.uri) throw new Error('Failed to generate monthly PDF (no uri returned)');
-    return res.uri;
+  static async generateMonthlyPDF(monthlyReport: MonthlyReport): Promise<void> {
+    const monthName = DataService.getMonthName(monthlyReport.month);
+    return this._generateAndSavePdf({
+      html: this.generateMonthlyHTML(monthlyReport),
+      defaultFileName: `DODOMA_CTF_${monthName}_${monthlyReport.year}.pdf`,
+    });
   }
 
-  /* ------------------ Advanced methods (new) ------------------ */
-
-  static async generateWeeklyPDFAdvanced(
-    weeklyReport: WeeklyReport,
-    opts?: { returnBase64?: boolean; logoPath?: string }
-  ): Promise<{ uri?: string; base64?: string }> {
+  // ---------- Core PDF creation & save/share flow ----------
+  private static async _generateAndSavePdf(opts: { html: string; defaultFileName: string }) {
     try {
-      const html = this.generateWeeklyHTML(weeklyReport, opts?.logoPath);
-
-      const printOptions: Parameters<typeof Print.printToFileAsync>[0] = {
-        html,
-        base64: !!opts?.returnBase64,
-      };
+      // 1) Generate PDF (printToFileAsync). Request base64 when possible for more control.
+      const printOptions: any = { html: opts.html };
+      // base64 supported on Android and can be helpful to write reliably
+      if (Platform.OS === 'android') printOptions.base64 = true;
 
       const result = await Print.printToFileAsync(printOptions);
-      // result: { uri, numberOfPages?, base64? }
+      // result: { uri, base64?, numberOfPages? }
 
-      if (opts?.returnBase64 && result.base64) {
-        return { base64: result.base64 };
+      // 2) Compose destination path in documentDirectory
+      const fileName = opts.defaultFileName.replace(/\s+/g, '_');
+      const destPath = `${FileSystem.documentDirectory}${fileName}`;
+
+      // 3) If base64 present -> write file with base64 encoding (Android path)
+      if ((result as any).base64) {
+        await FileSystem.writeAsStringAsync(destPath, (result as any).base64, {
+          encoding: FileSystem.EncodingType.Base64,
+        });
+      } else if (result.uri) {
+        // on iOS & other cases: move/copy the generated file from cache to documents
+        // Ensure proper file:// prefix for moveAsync (FileSystem.moveAsync expects file:// uri)
+        const from = (result.uri.startsWith('file://') ? result.uri : `file://${result.uri}`);
+        const to = destPath.startsWith('file://') ? destPath : destPath;
+        // If dest already exists, remove first
+        const info = await FileSystem.getInfoAsync(destPath);
+        if (info.exists) {
+          await FileSystem.deleteAsync(destPath, { idempotent: true });
+        }
+        // Move: Note: moveAsync 'to' argument must be a proper file path (documentDirectory + filename)
+        await FileSystem.moveAsync({ from, to });
+      } else {
+        throw new Error('Unable to obtain PDF data (no uri or base64 returned by Print.printToFileAsync).');
       }
 
-      if (!result.uri) {
-        throw new Error('expo-print returned no URI for generated PDF');
-      }
-
-      await this.ensureReportsDir();
-
-      const fileName = this.safeFileName(
-        `DODOMA_CTF_Week_${weeklyReport.weekNumber}_${weeklyReport.weekStartDate}.pdf`
-      );
-      const newUri = `${REPORTS_DIR}${fileName}`;
-
-      try {
-        await FileSystem.moveAsync({ from: result.uri, to: newUri });
-      } catch (moveErr) {
-        console.warn('PDFService.moveAsync failed, attempting copy fallback', moveErr);
+      // 4) Try to share/save the file. Sharing opens system share dialog where user can "Save to Files" or choose storage apps.
+      const finalUri = destPath; // FileSystem uses file paths like 'file:///...' internally for certain APIs
+      if (Platform.OS === 'ios') {
+        // iOS: Sharing is expected to work
+        await Sharing.shareAsync(finalUri, { mimeType: 'application/pdf', dialogTitle: 'Pakua Taarifa' });
+      } else {
+        // Android: sharing should work; optionally attempt to save to MediaLibrary (needs permission)
+        let shared = false;
         try {
-          await FileSystem.copyAsync({ from: result.uri, to: newUri });
-          await FileSystem.deleteAsync(result.uri, { idempotent: true });
-        } catch (copyErr) {
-          console.error('PDFService.copyAsync fallback also failed', copyErr);
-          // return original cached uri as last resort
-          return { uri: result.uri };
+          await Sharing.shareAsync(finalUri, { mimeType: 'application/pdf', dialogTitle: 'Pakua Taarifa' });
+          shared = true;
+        } catch (e) {
+          // fallback to media library
+          console.warn('Sharing failed, will try to save to media library:', e);
+        }
+
+        if (!shared) {
+          const permission = await MediaLibrary.requestPermissionsAsync();
+          if (permission.granted) {
+            // createAssetAsync sometimes expects 'file://' prefix
+            const localUri = finalUri.startsWith('file://') ? finalUri : `file://${finalUri}`;
+            await MediaLibrary.createAssetAsync(localUri);
+            Alert.alert('Imekamilika!', `PDF imehifadhiwa kwenye vifaa ivyo: ${fileName}`);
+            return;
+          } else {
+            throw new Error('Media library permission denied — cannot save PDF.');
+          }
         }
       }
 
-      return { uri: newUri };
-    } catch (error) {
-      console.error('generateWeeklyPDFAdvanced error', error);
-      throw new Error('Failed to generate weekly PDF');
+      // Success
+      Alert.alert('Imekamilika!', `PDF imehifadhiwa / kushirikiwa: ${fileName}`);
+    } catch (err) {
+      console.error('PDF generation error:', err);
+      Alert.alert('Hitilafu', 'Kujenga PDF kulishindikana. Jaribu tena au angalia ruhusa za kuhifadhi.');
+      throw err;
     }
   }
 
-  static async generateMonthlyPDFAdvanced(
-    monthlyReport: MonthlyReport,
-    opts?: { returnBase64?: boolean; logoPath?: string }
-  ): Promise<{ uri?: string; base64?: string }> {
-    try {
-      const html = this.generateMonthlyHTML(monthlyReport, opts?.logoPath);
+  // ---------- Helpers to format & aggregate (kept from your original) ----------
+  private static fmtNum(n: number) {
+    return Number(n || 0).toLocaleString();
+  }
 
-      const printOptions: Parameters<typeof Print.printToFileAsync>[0] = {
-        html,
-        base64: !!opts?.returnBase64,
-      };
+  private static fmtMoney(n: number) {
+    return `TSH ${this.fmtNum(Number(n || 0))}`;
+  }
 
-      const result = await Print.printToFileAsync(printOptions);
+  private static aggregateBooksFromDaily(dailies: DailyReport[]) {
+    const map: Record<string, { title: string; unitPrice: number; qty: number; revenue: number }> = {};
+    let totalQty = 0;
+    let totalRevenue = 0;
 
-      if (opts?.returnBase64 && result.base64) {
-        return { base64: result.base64 };
-      }
-
-      if (!result.uri) {
-        throw new Error('expo-print returned no URI for generated PDF');
-      }
-
-      await this.ensureReportsDir();
-
-      const monthName = DataService.getMonthName(monthlyReport.month);
-      const fileName = this.safeFileName(`DODOMA_CTF_${monthName}_${monthlyReport.year}.pdf`);
-      const newUri = `${REPORTS_DIR}${fileName}`;
-
-      try {
-        await FileSystem.moveAsync({ from: result.uri, to: newUri });
-      } catch (moveErr) {
-        console.warn('PDFService.moveAsync failed, attempting copy fallback', moveErr);
-        try {
-          await FileSystem.copyAsync({ from: result.uri, to: newUri });
-          await FileSystem.deleteAsync(result.uri, { idempotent: true });
-        } catch (copyErr) {
-          console.error('PDFService.copyAsync fallback also failed', copyErr);
-          return { uri: result.uri };
+    (dailies || []).forEach((d) => {
+      const bookSales = Array.isArray(d.bookSales) ? d.bookSales : [];
+      bookSales.forEach((b: BookSale) => {
+        const title = (b.title || 'Untitled').trim();
+        const price = Number(b.price || 0);
+        const qty = Number(b.quantity || 0);
+        if (!map[title]) {
+          map[title] = { title, unitPrice: price, qty: 0, revenue: 0 };
         }
-      }
+        map[title].qty += qty;
+        map[title].revenue += price * qty;
+        map[title].unitPrice = price || map[title].unitPrice;
+        totalQty += qty;
+        totalRevenue += price * qty;
+      });
+    });
 
-      return { uri: newUri };
-    } catch (error) {
-      console.error('generateMonthlyPDFAdvanced error', error);
-      throw new Error('Failed to generate monthly PDF');
-    }
+    const list = Object.values(map);
+    list.sort((a, b) => b.revenue - a.revenue);
+    return { list, totalQty, totalRevenue };
   }
 
-  /* ------------------ Printable HTML templates ------------------ */
-
-  private static generateWeeklyHTML(report: WeeklyReport, logoPath?: string): string {
+  // ---------- Weekly HTML ----------
+  private static generateWeeklyHTML(report: WeeklyReport): string {
     const weekStart = new Date(report.weekStartDate);
     const weekEnd = new Date(report.weekEndDate);
-    const logoHtml = logoPath ? `<img src="${logoPath}" class="brand-logo" alt="logo"/>` : '';
+    const dailyReports: DailyReport[] = Array.isArray(report.dailyReports) ? report.dailyReports : [];
 
-    return `<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>Weekly Report - Week ${escapeHtml(String(report.weekNumber))}</title>
-  <style>
-    @page { size: A4; margin: 18mm; }
-    html,body { height:100%; margin:0; padding:0; background:#fff; }
-    body{font-family:"Helvetica Neue", Arial, sans-serif;color:#222;font-size:12px;line-height:1.4}
-    .doc-header{display:flex;justify-content:space-between;align-items:center;border-bottom:2px solid #1e3a8a;padding-bottom:10px;margin-bottom:12px}
-    .brand{display:flex;align-items:center;gap:12px}
-    .brand-logo{width:56px;height:56px;object-fit:contain}
-    .brand-title{font-size:18px;font-weight:700;color:#1e3a8a}
-    .meta{text-align:right;font-size:12px;color:#555}
-    .report-info{background:#f8fafc;padding:10px;border-radius:6px;margin-bottom:14px;display:flex;justify-content:space-between;gap:12px}
-    .summary{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:14px}
-    .summary .card{background:#fff;border:1px solid #e6eef8;padding:10px;border-radius:6px;text-align:center}
-    .summary .value{font-size:18px;font-weight:700;color:#1e3a8a}
-    .summary .label{font-size:11px;color:#6b7280;margin-top:6px}
-    table{width:100%;border-collapse:collapse;margin-top:6px}
-    thead{background:#f1f5f9}
-    thead th{padding:8px 10px;border:1px solid #e6eef8;font-weight:700;text-align:left;font-size:12px}
-    tbody td{padding:8px 10px;border:1px solid #e6eef8;vertical-align:top;font-size:12px}
-    tbody tr:nth-child(even) td{background:#fcfdff}
-    thead{display:table-header-group}
-    tfoot{display:table-row-group}
-    .daily-row,.card{page-break-inside:avoid}
-    .doc-footer{margin-top:18px;border-top:1px solid #e6eef8;padding-top:10px;text-align:center;color:#666;font-size:11px}
-    .signatures{display:flex;gap:32px;margin-top:18px}
-    .signature{flex:1;text-align:left}
-    .sig-line{margin-top:36px;border-top:1px solid #ccc;width:70%}
-  </style>
-</head>
-<body>
-  <div class="doc-header">
-    <div class="brand">
-      ${logoHtml}
-      <div>
-        <div class="brand-title">DODOMA CTF</div>
-        <div style="font-size:12px;color:#666">Student Canvassing Weekly Report</div>
-      </div>
-    </div>
-    <div class="meta">
-      <div><strong>Week:</strong> ${escapeHtml(String(report.weekNumber))}</div>
-      <div><strong>Period:</strong> ${escapeHtml(weekStart.toLocaleDateString())} – ${escapeHtml(weekEnd.toLocaleDateString())}</div>
-      <div style="margin-top:6px;">Generated: ${escapeHtml(new Date().toLocaleString())}</div>
-    </div>
-  </div>
+    const totals = dailyReports.reduce(
+      (acc, d) => {
+        acc.hours += Number(d.hoursWorked || 0);
+        acc.books += Number(d.booksSold || 0);
+        acc.sales += Number(d.dailyAmount || 0);
+        acc.freeLit += Number(d.freeLiterature || 0);
+        acc.vop += Number(d.vopActivities || 0);
+        acc.church += Number(d.churchAttendees || 0);
+        acc.prayers += Number(d.prayersOffered || 0);
+        acc.bible += Number(d.bibleStudies || 0);
+        acc.baptisms += Number(d.baptismsPerformed || 0);
+        acc.visits += Number(d.peopleVisited || 0);
+        return acc;
+      },
+      { hours: 0, books: 0, sales: 0, freeLit: 0, vop: 0, church: 0, prayers: 0, bible: 0, baptisms: 0, visits: 0 }
+    );
 
-  <div class="report-info">
-    <div>
-      <div><strong>Student:</strong> ${escapeHtml(report.studentName || '')}</div>
-      <div style="color:#555;margin-top:4px;"><strong>Phone:</strong> ${escapeHtml(report.phoneNumber || '')}</div>
-    </div>
-    <div style="text-align:right;color:#555">
-      <div><strong>Week Start:</strong> ${escapeHtml(weekStart.toLocaleDateString())}</div>
-      <div style="margin-top:4px;"><strong>Week End:</strong> ${escapeHtml(weekEnd.toLocaleDateString())}</div>
-    </div>
-  </div>
+    const booksAgg = this.aggregateBooksFromDaily(dailyReports);
 
-  <div class="summary">
-    <div class="card"><div class="value">${escapeHtml(String(Number(report.totalHours || 0)))}</div><div class="label">Total Hours</div></div>
-    <div class="card"><div class="value">${escapeHtml(String(Number(report.totalBooksSold || 0)))}</div><div class="label">Books Sold</div></div>
-    <div class="card"><div class="value">TSH ${escapeHtml(Number(report.totalAmount || 0).toLocaleString())}</div><div class="label">Total Sales</div></div>
-  </div>
+    // Add Student name & report type at top prominently
+    return `
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <meta charset="utf-8" />
+          <title>Weekly Report - ${report.studentName || '-'} - Week ${report.weekNumber}</title>
+          <style>
+            body { font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial; margin:20px; color:#222; }
+            .header { text-align:center; border-bottom:3px solid #1e3a8a; padding-bottom:10px; margin-bottom:20px; }
+            .title { font-size:20px; font-weight:800; color:#0f172a; }
+            .subtitle { font-size:13px; color:#374151; margin-top:6px; }
+            .meta { margin-top:8px; font-size:12px; color:#374151; }
+            table.info { width:100%; border-collapse:collapse; margin-top:14px; }
+            table.info td { padding:8px; border:1px solid #e5e7eb; }
+            table.info td.label { font-weight:700; background:#f8fafc; width:30% }
+            .section { margin-top:18px; }
+            .section-title { font-weight:700; color:#1e3a8a; margin-bottom:8px; }
+            table.daily { width:100%; border-collapse:collapse; font-size:12px; }
+            table.daily th, table.daily td { border:1px solid #e5e7eb; padding:6px; text-align:center; }
+            table.daily th { background:#111827; color:#fff; }
+            .books th { background:#059669; color:#fff; padding:8px; }
+            .small { font-size:12px; color:#6b7280; }
+            .footer { margin-top:20px; border-top:1px solid #e5e7eb; padding-top:10px; font-size:12px; color:#6b7280; text-align:center; }
+          </style>
+        </head>
+        <body>
+          <div class="header">
+            <div class="title">DODOMA CTF — WEEKLY REPORT</div>
+            <div class="subtitle">${report.studentName || '-'} · Week ${report.weekNumber}</div>
+            <div class="meta">${weekStart.toLocaleDateString()} — ${weekEnd.toLocaleDateString()}</div>
+          </div>
 
-  <div class="section">
-    <strong style="font-size:13px;color:#1e3a8a">Daily Reports</strong>
-    <table role="table" aria-label="Daily reports">
-      <thead>
-        <tr>
-          <th style="width:14%;">Date</th>
-          <th style="width:10%;">Hours</th>
-          <th style="width:12%;">Books</th>
-          <th style="width:18%;">Sales (TSH)</th>
-          <th style="width:18%;">Bible Studies</th>
-          <th style="width:18%;">Prayers</th>
-          <th style="width:18%;">Visits</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${report.dailyReports
-          .map(
-            (d) => `
-          <tr class="daily-row">
-            <td>${escapeHtml(new Date(d.date).toLocaleDateString())} <div style="color:#666;font-size:11px;">${escapeHtml(
-              DataService.getDayName(new Date(d.date))
-            )}</div></td>
-            <td>${escapeHtml(String(Number(d.hoursWorked || 0)))}</td>
-            <td>${escapeHtml(String(Number(d.booksSold || 0)))}</td>
-            <td>TSH ${escapeHtml(Number(d.dailyAmount || 0).toLocaleString())}</td>
-            <td>${escapeHtml(String(Number(d.bibleStudies || 0)))}</td>
-            <td>${escapeHtml(String(Number(d.prayersOffered || 0)))}</td>
-            <td>${escapeHtml(String(Number(d.peopleVisited || 0)))}</td>
-          </tr>
-        `
-          )
-          .join('')}
-      </tbody>
-    </table>
-  </div>
+          <table class="info">
+            <tr><td class="label">Student</td><td>${report.studentName || '-'}</td></tr>
+            <tr><td class="label">Phone</td><td>${report.phoneNumber || '-'}</td></tr>
+            <tr><td class="label">Week</td><td>${report.weekNumber} (${weekStart.toLocaleDateString()} — ${weekEnd.toLocaleDateString()})</td></tr>
+          </table>
 
-  <div class="signatures">
-    <div class="signature"><div style="font-weight:700">Prepared by</div><div class="sig-line"></div></div>
-    <div class="signature"><div style="font-weight:700">Reviewed by</div><div class="sig-line"></div></div>
-  </div>
+          <div class="section">
+            <div class="section-title">Weekly Summary</div>
+            <div style="display:flex; gap:12px; flex-wrap:wrap;">
+              <div style="min-width:120px; padding:10px; border:1px solid #e5e7eb; border-radius:6px; text-align:center;">
+                <div style="font-weight:700; font-size:16px;">${this.fmtNum(report.totalHours)}</div><div class="small">Total Hours</div>
+              </div>
+              <div style="min-width:120px; padding:10px; border:1px solid #e5e7eb; border-radius:6px; text-align:center;">
+                <div style="font-weight:700; font-size:16px;">${this.fmtNum(report.totalBooksSold)}</div><div class="small">Books Sold</div>
+              </div>
+              <div style="min-width:160px; padding:10px; border:1px solid #e5e7eb; border-radius:6px; text-align:center;">
+                <div style="font-weight:700; font-size:16px;">${this.fmtMoney(report.totalAmount)}</div><div class="small">Total Sales</div>
+              </div>
+            </div>
+          </div>
 
-  <div class="doc-footer">DODOMA CTF — Student Canvassing Report System.</div>
-</body>
-</html>`;
+          <div class="section">
+            <div class="section-title">Daily Breakdown</div>
+            <table class="daily">
+              <thead>
+                <tr>
+                  <th>Day</th><th>Hours</th><th>Books</th><th>Sales</th><th>Free Lit.</th><th>VOP</th><th>Church</th><th>Prayers</th><th>Bible</th><th>Baptisms</th><th>Visits</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${(dailyReports || []).map(d => `
+                  <tr>
+                    <td style="text-align:left; font-weight:600;">${DataService.getDayName(new Date(d.date))} (${new Date(d.date).toLocaleDateString()})</td>
+                    <td>${this.fmtNum(Number(d.hoursWorked || 0))}</td>
+                    <td>${this.fmtNum(Number(d.booksSold || 0))}</td>
+                    <td style="text-align:right">${this.fmtMoney(Number(d.dailyAmount || 0))}</td>
+                    <td>${this.fmtNum(Number(d.freeLiterature || 0))}</td>
+                    <td>${this.fmtNum(Number(d.vopActivities || 0))}</td>
+                    <td>${this.fmtNum(Number(d.churchAttendees || 0))}</td>
+                    <td>${this.fmtNum(Number(d.prayersOffered || 0))}</td>
+                    <td>${this.fmtNum(Number(d.bibleStudies || 0))}</td>
+                    <td>${this.fmtNum(Number(d.baptismsPerformed || 0))}</td>
+                    <td>${this.fmtNum(Number(d.peopleVisited || 0))}</td>
+                  </tr>
+                `).join('')}
+                <tr style="font-weight:700;">
+                  <td>WEEK TOTAL</td>
+                  <td>${this.fmtNum(totals.hours)}</td>
+                  <td>${this.fmtNum(totals.books)}</td>
+                  <td style="text-align:right">${this.fmtMoney(totals.sales)}</td>
+                  <td>${this.fmtNum(totals.freeLit)}</td>
+                  <td>${this.fmtNum(totals.vop)}</td>
+                  <td>${this.fmtNum(totals.church)}</td>
+                  <td>${this.fmtNum(totals.prayers)}</td>
+                  <td>${this.fmtNum(totals.bible)}</td>
+                  <td>${this.fmtNum(totals.baptisms)}</td>
+                  <td>${this.fmtNum(totals.visits)}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="section">
+            <div class="section-title">Books Sold Details</div>
+            ${booksAgg.list.length > 0 ? `
+              <table class="books" style="width:100%; border-collapse:collapse; margin-top:8px;">
+                <thead><tr><th>Title</th><th>Unit Price</th><th>Quantity</th><th>Total</th></tr></thead>
+                <tbody>
+                  ${booksAgg.list.map(b => `
+                    <tr>
+                      <td>${b.title}</td>
+                      <td style="text-align:right">${this.fmtNum(b.unitPrice)}</td>
+                      <td style="text-align:right">${this.fmtNum(b.qty)}</td>
+                      <td style="text-align:right">${this.fmtNum(b.revenue)}</td>
+                    </tr>
+                  `).join('')}
+                  <tr style="font-weight:700;">
+                    <td>GRAND TOTAL</td><td></td>
+                    <td style="text-align:right">${this.fmtNum(booksAgg.totalQty)}</td>
+                    <td style="text-align:right">${this.fmtMoney(booksAgg.totalRevenue)}</td>
+                  </tr>
+                </tbody>
+              </table>
+            ` : `<div class="small">Hakuna mauzo ya vitabu katika wiki hii.</div>`}
+          </div>
+
+          <div class="footer">Generated on ${new Date().toLocaleDateString()} ${new Date().toLocaleTimeString()} · DODOMA CTF 2025</div>
+        </body>
+      </html>
+    `;
   }
 
-  private static generateMonthlyHTML(report: MonthlyReport, logoPath?: string): string {
+  // ---------- Monthly HTML ----------
+  private static generateMonthlyHTML(report: MonthlyReport): string {
     const monthName = DataService.getMonthName(report.month);
-    const logoHtml = logoPath ? `<img src="${logoPath}" class="brand-logo" alt="logo"/>` : '';
-    return `<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>Monthly Report - ${escapeHtml(monthName)} ${escapeHtml(String(report.year))}</title>
-  <style>
-    @page { size: A4; margin: 18mm; }
-    body{font-family:"Helvetica Neue",Arial,sans-serif;color:#222;margin:0;font-size:12px}
-    .wrap{padding:0 4mm}
-    .header{display:flex;justify-content:space-between;align-items:center;border-bottom:2px solid #1e3a8a;padding:8px 0;margin-bottom:12px}
-    .brand-title{font-weight:700;color:#1e3a8a;font-size:16px}
-    .meta{font-size:12px;color:#555;text-align:right}
-    .section-title{color:#1e3a8a;font-weight:700;margin:8px 0}
-    .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:12px}
-    .card{background:#fff;border:1px solid #e6eef8;padding:10px;border-radius:6px;text-align:center}
-    .card .num{font-weight:700;color:#1e3a8a;font-size:16px}
-    .week-list{margin-top:6px}
-    .week-card{border:1px solid #e6eef8;padding:10px;border-radius:6px;margin-bottom:8px}
-    .footer{margin-top:14px;border-top:1px solid #e6eef8;padding-top:8px;text-align:center;color:#666;font-size:11px}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="header">
-      <div>
-        <div class="brand-title">DODOMA CTF</div>
-        <div style="font-size:12px;color:#666">Monthly Canvassing Report</div>
-      </div>
-      <div class="meta">
-        <div><strong>${escapeHtml(monthName)} ${escapeHtml(String(report.year))}</strong></div>
-        <div>Generated: ${escapeHtml(new Date().toLocaleString())}</div>
-      </div>
-    </div>
-
-    <div><strong>Student:</strong> ${escapeHtml(report.studentName || '')} &nbsp; <strong>Phone:</strong> ${escapeHtml(report.phoneNumber || '')}</div>
-
-    <div class="section-title">Monthly Summary</div>
-    <div class="grid">
-      <div class="card"><div class="num">${escapeHtml(String(Number(report.totalHours || 0)))}</div><div style="font-size:11px;color:#666;margin-top:6px">Total Hours</div></div>
-      <div class="card"><div class="num">${escapeHtml(String(Number(report.totalBooks || 0)))}</div><div style="font-size:11px;color:#666;margin-top:6px">Books Sold</div></div>
-      <div class="card"><div class="num">TSH ${escapeHtml(Number(report.totalAmount || 0).toLocaleString())}</div><div style="font-size:11px;color:#666;margin-top:6px">Total Sales</div></div>
-      <div class="card"><div class="num">${escapeHtml(String(Number(report.totalMinistryActivities || 0)))}</div><div style="font-size:11px;color:#666;margin-top:6px">Ministry Activities</div></div>
-    </div>
-
-    <div class="section-title">Weekly Breakdown</div>
-    <div class="week-list">
-      ${report.weeklyReports
-        .map(
-          (w) => `<div class="week-card">
-          <div style="font-weight:700;color:#1e3a8a">Week ${escapeHtml(String(w.weekNumber))} — ${escapeHtml(
-            new Date(w.weekStartDate).toLocaleDateString()
-          )} to ${escapeHtml(new Date(w.weekEndDate).toLocaleDateString())}</div>
-          <div style="margin-top:6px">Hours: ${escapeHtml(String(Number(w.totalHours || 0)))} | Books: ${escapeHtml(
-            String(Number(w.totalBooksSold || 0))
-          )} | Sales: TSH ${escapeHtml(Number(w.totalAmount || 0).toLocaleString())}</div>
-          <div style="color:#666;margin-top:6px">Ministry: ${escapeHtml(String(Number(w.totalBibleStudies || 0)))} Bible Studies, ${escapeHtml(
-            String(Number(w.totalPrayersOffered || 0))
-          )} Prayers, ${escapeHtml(String(Number(w.totalBaptismsPerformed || 0)))} Baptisms</div>
-        </div>`
-        )
-        .join('')}
-    </div>
-
-    <div class="footer">DODOMA CTF — Generated ${escapeHtml(new Date().toLocaleString())}</div>
-  </div>
-</body>
-</html>`;
-  }
-
-  /* --------- Helpers --------- */
-
-  private static async ensureReportsDir() {
-    try {
-      const info = await FileSystem.getInfoAsync(REPORTS_DIR);
-      if (!info.exists) {
-        await FileSystem.makeDirectoryAsync(REPORTS_DIR, { intermediates: true });
+    const allDailyReports: DailyReport[] = [];
+    (report.weeklyReports || []).forEach((w: WeeklyReport) => {
+      if (Array.isArray((w as any).dailyReports)) {
+        (w as any).dailyReports.forEach((d: DailyReport) => allDailyReports.push(d));
       }
-    } catch (err) {
-      console.warn('ensureReportsDir failed', err);
-      // allow moveAsync to fail later if dir cannot be created
-    }
+    });
+
+    const weeklySummaryHtml = (report.weeklyReports || []).map((w: WeeklyReport) => `
+      <div style="border:1px solid #e5e7eb; padding:8px; border-radius:6px; margin-bottom:8px;">
+        <div style="font-weight:700; color:#1e3a8a;">Week ${w.weekNumber} · ${new Date(w.weekStartDate).toLocaleDateString()} - ${new Date(w.weekEndDate).toLocaleDateString()}</div>
+        <div>Hours: ${this.fmtNum(w.totalHours)} | Books: ${this.fmtNum(w.totalBooksSold)} | Sales: ${this.fmtMoney(w.totalAmount)}</div>
+        <div style="font-size:12px; color:#6b7280;">Ministry: ${this.fmtNum(w.totalBibleStudies)} Bible Studies, ${this.fmtNum(w.totalPrayersOffered)} Prayers, ${this.fmtNum(w.totalBaptismsPerformed)} Baptisms</div>
+      </div>
+    `).join('');
+
+    const booksAgg = this.aggregateBooksFromDaily(allDailyReports);
+
+    return `
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <meta charset="utf-8" />
+          <title>Monthly Report - ${report.studentName || '-'} - ${monthName} ${report.year}</title>
+          <style>
+            body { font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial; margin:20px; color:#222; }
+            .header { text-align:center; border-bottom:3px solid #1e3a8a; padding-bottom:10px; margin-bottom:18px; }
+            .title { font-size:20px; font-weight:800; color:#0f172a; }
+            .subtitle { font-size:13px; color:#374151; margin-top:6px; }
+            .section { margin-top:14px; }
+            .books th { background:#059669; color:#fff; padding:8px; }
+            .small { font-size:12px; color:#6b7280; }
+            .footer { margin-top:20px; border-top:1px solid #e5e7eb; padding-top:10px; font-size:12px; color:#6b7280; text-align:center; }
+          </style>
+        </head>
+        <body>
+          <div class="header">
+            <div class="title">DODOMA CTF — MONTHLY REPORT</div>
+            <div class="subtitle">${report.studentName || '-'} · ${monthName} ${report.year}</div>
+          </div>
+
+          <div style="display:flex; gap:12px; justify-content:space-between;">
+            <div><strong>Student:</strong> ${report.studentName || '-'}<br /><span class="small">Phone: ${report.phoneNumber || '-'}</span></div>
+            <div><strong>Month:</strong> ${monthName} ${report.year}<br /><span class="small">Weeks: ${this.fmtNum((report.weeklyReports || []).length)}</span></div>
+          </div>
+
+          <div class="section">
+            <div style="font-weight:700; color:#1e3a8a; margin-bottom:8px;">Monthly Summary</div>
+            <div style="display:grid; grid-template-columns:repeat(4,1fr); gap:12px;">
+              <div style="padding:10px; border:1px solid #e5e7eb; border-radius:6px; text-align:center;">
+                <div style="font-weight:700; font-size:16px;">${this.fmtNum(report.totalHours)}</div><div class="small">Total Hours</div>
+              </div>
+              <div style="padding:10px; border:1px solid #e5e7eb; border-radius:6px; text-align:center;">
+                <div style="font-weight:700; font-size:16px;">${this.fmtNum(report.totalBooks)}</div><div class="small">Books Sold</div>
+              </div>
+              <div style="padding:10px; border:1px solid #e5e7eb; border-radius:6px; text-align:center;">
+                <div style="font-weight:700; font-size:16px;">${this.fmtMoney(report.totalAmount)}</div><div class="small">Total Sales</div>
+              </div>
+              <div style="padding:10px; border:1px solid #e5e7eb; border-radius:6px; text-align:center;">
+                <div style="font-weight:700; font-size:16px;">${this.fmtNum(report.totalMinistryActivities || 0)}</div><div class="small">Ministry Activities</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="section">
+            <div style="font-weight:700; color:#1e3a8a; margin-bottom:8px;">Weekly Breakdown</div>
+            ${weeklySummaryHtml || '<div class="small">No weekly data available</div>'}
+          </div>
+
+          <div class="section">
+            <div style="font-weight:700; color:#1e3a8a; margin-bottom:8px;">Books Sold (Monthly Aggregated)</div>
+            ${booksAgg.list.length > 0 ? `
+              <table class="books" style="width:100%; border-collapse:collapse;">
+                <thead><tr><th>Book Title</th><th>Unit Price</th><th>Quantity</th><th>Total</th></tr></thead>
+                <tbody>
+                  ${booksAgg.list.map(b => `
+                    <tr>
+                      <td>${b.title}</td>
+                      <td style="text-align:right">${this.fmtNum(b.unitPrice)}</td>
+                      <td style="text-align:right">${this.fmtNum(b.qty)}</td>
+                      <td style="text-align:right">${this.fmtNum(b.revenue)}</td>
+                    </tr>
+                  `).join('')}
+                  <tr style="font-weight:700;">
+                    <td>GRAND TOTAL</td><td></td>
+                    <td style="text-align:right">${this.fmtNum(booksAgg.totalQty)}</td>
+                    <td style="text-align:right">${this.fmtMoney(booksAgg.totalRevenue)}</td>
+                  </tr>
+                </tbody>
+              </table>
+            ` : `<div class="small">Hakuna mauzo ya vitabu katika mwezi huu.</div>`}
+          </div>
+
+          <div class="footer">Generated on ${new Date().toLocaleDateString()} ${new Date().toLocaleTimeString()} · DODOMA CTF 2025</div>
+        </body>
+      </html>
+    `;
   }
 
-  private static safeFileName(name: string) {
-    // keep alphanum, underscores, dashes and dots; replace others with _
-    return name.replace(/[^a-zA-Z0-9._-]/g, '_');
+  // ---------- Utilities ----------
+  private static _safeDateStr(d: string) {
+    return new Date(d).toISOString().split('T')[0];
   }
-}
-
-/* ---------------- helper ---------------- */
-function escapeHtml(input: string | number | undefined | null): string {
-  if (input === undefined || input === null) return '';
-  return String(input)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
 }

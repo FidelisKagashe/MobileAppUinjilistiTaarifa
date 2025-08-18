@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useCallback } from 'react';
+// app/(tabs)/dashboard.tsx
+import React, { useEffect, useState } from 'react';
 import {
   View,
   Text,
@@ -8,13 +9,16 @@ import {
   Alert,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { Plus, TrendingUp, Book, DollarSign, Calendar, Clock, CircleAlert as AlertCircle, FileText, ChartBar as BarChart3, Settings } from 'lucide-react-native';
+import { Plus, FileText, Book, DollarSign, Clock, CircleAlert as AlertCircle, ChartBar as BarChart3, Settings } from 'lucide-react-native';
 import { router } from 'expo-router';
 import { DataService } from '@/services/DataService';
+import { LanguageService } from '@/services/LanguageService';
 import { WeeklyReport, DailyReport, UserProfile } from '@/types/Report';
-import { useIsFocused } from '@react-navigation/native';
+import { useTheme } from '../providers/ThemeProvider';
 
 export default function DashboardScreen() {
+  const { theme } = useTheme();
+
   const [todayReport, setTodayReport] = useState<DailyReport | null>(null);
   const [currentWeekReport, setCurrentWeekReport] = useState<WeeklyReport | null>(null);
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
@@ -23,132 +27,128 @@ export default function DashboardScreen() {
   const [totalSales, setTotalSales] = useState(0);
   const [totalBooks, setTotalBooks] = useState(0);
   const [loading, setLoading] = useState(true);
-  const [weekLocked, setWeekLocked] = useState(false);
 
-  const isFocused = useIsFocused();
+  // small tick to force rerender on language change
+  const [langTick, setLangTick] = useState(0);
 
-  const loadDashboardData = useCallback(async () => {
-    setLoading(true);
+  useEffect(() => {
+    (async () => {
+      await DataService.initialize();
+      await LanguageService.initialize();
+      await loadDashboardData();
+
+      // subscribe to language changes so UI updates automatically
+      const unsubscribe = LanguageService.subscribe(() => setLangTick((t) => t + 1));
+      return unsubscribe;
+    })();
+
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const loadDashboardData = async () => {
     try {
-      console.debug('[Dashboard] loading data...');
       const profile = await DataService.getUserProfile();
       const today = new Date().toISOString().split('T')[0];
-
-      // load daily and weekly data
       const todayReportData = await DataService.getDailyReportByDate(today);
       const currentWeek = await DataService.getCurrentWeekReport();
       const weeklyReports = await DataService.getAllWeeklyReports();
-      const missing = await DataService.getMissingDates();
-
-      // check locked week from DataService
-      const weekStart = DataService.getWeekStartDate(new Date());
-      const locked = await DataService.isWeekLocked(weekStart);
+      const missing = await DataService.getMissingDatesFromFirstUse();
 
       setUserProfile(profile);
       setTodayReport(todayReportData);
       setCurrentWeekReport(currentWeek);
-      setMissingDates(missing || []);
-      setTotalReports(Array.isArray(weeklyReports) ? weeklyReports.length : 0);
+      setMissingDates(missing);
+      setTotalReports(weeklyReports.length);
 
-      const sales = (weeklyReports || []).reduce((sum, report) => sum + (Number(report.totalAmount) || 0), 0);
-      const books = (weeklyReports || []).reduce((sum, report) => sum + (Number(report.totalBooksSold) || 0), 0);
+      const sales = weeklyReports.reduce((sum, report) => sum + (report.totalAmount || 0), 0);
+      const books = weeklyReports.reduce((sum, report) => sum + (report.totalBooksSold || 0), 0);
 
       setTotalSales(sales);
       setTotalBooks(books);
-      setWeekLocked(Boolean(locked));
-
-      console.debug('[Dashboard] loaded:', { todayReportData, currentWeek, weeklyCount: weeklyReports?.length, missingCount: missing?.length, weekLocked: locked });
     } catch (error) {
-      console.error('[Dashboard] Error loading dashboard data:', error);
+      console.error('Error loading dashboard data:', error);
+      Alert.alert(LanguageService.t('error'), LanguageService.t('networkError'));
     } finally {
       setLoading(false);
     }
-  }, []);
-
-  // reload when screen is focused (solves "data saved but dashboard not updated" issue)
-  useEffect(() => {
-    if (isFocused) loadDashboardData();
-  }, [isFocused, loadDashboardData]);
+  };
 
   const StatCard = ({ title, value, subtitle, icon: Icon, color }: any) => (
-    <View style={[styles.statCard, { borderLeftColor: color }]}>
+    <View style={[styles.statCard, { borderLeftColor: color, backgroundColor: theme.card }]}>
       <View style={styles.statHeader}>
         <Icon size={24} color={color} />
-        <Text style={styles.statTitle}>{title}</Text>
+        <Text style={[styles.statTitle, { color: theme.textSecondary }]}>{title}</Text>
       </View>
-      <Text style={styles.statValue}>{value}</Text>
-      {subtitle && <Text style={styles.statSubtitle}>{subtitle}</Text>}
+      <Text style={[styles.statValue, { color: theme.text }]}>{value}</Text>
+      {subtitle && <Text style={[styles.statSubtitle, { color: theme.textSecondary }]}>{subtitle}</Text>}
     </View>
   );
 
   const QuickAction = ({ title, icon: Icon, onPress, color }: any) => (
-    <TouchableOpacity style={styles.quickAction} onPress={onPress} disabled={weekLocked && title === 'Taarifa Mpya'}>
+    <TouchableOpacity style={[styles.quickAction, { backgroundColor: theme.card }]} onPress={onPress}>
       <Icon size={32} color={color} />
-      <Text style={styles.quickActionText}>{title}</Text>
+      <Text style={[styles.quickActionText, { color: theme.text }]}>{title}</Text>
     </TouchableOpacity>
   );
 
-  const getCurrentWeekStatusLocal = () => {
-    // local fallback message if DataService lock check isn't ready yet
-    if (weekLocked) return { status: 'locked', message: 'Wiki imefungwa' };
+  const getCurrentWeekStatus = () => {
     const today = new Date();
     const dayOfWeek = today.getDay(); // 0 = Sunday, 6 = Saturday
     const currentHour = today.getHours();
 
     if (dayOfWeek === 5 && currentHour >= 18) {
-      return { status: 'locked', message: 'Wiki imefungwa (Ijumaa 6:00 PM)' };
+      return { status: 'locked', message: LanguageService.t('weekLocked') };
     } else if (dayOfWeek === 6) {
-      return { status: 'weekend', message: 'Jumamosi - Hakuna kazi' };
+      return { status: 'weekend', message: LanguageService.t('weekend') };
     } else {
-      return { status: 'active', message: 'Wiki inaendelea' };
+      return { status: 'active', message: LanguageService.t('weekActive') };
     }
   };
 
-  const weekStatus = getCurrentWeekStatusLocal();
+  const weekStatus = getCurrentWeekStatus();
 
   return (
-    <SafeAreaView style={styles.container}>
+    <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
       <ScrollView showsVerticalScrollIndicator={false}>
         {/* Header */}
-        <View style={styles.header}>
-          <Text style={styles.welcomeText}>Karibu Tena</Text>
-          <Text style={styles.titleText}>{userProfile?.fullName || 'DODOMA CTF 2025'}</Text>
-          <Text style={styles.subtitleText}>Mfumo wa Taarifa za Uuzaji</Text>
+        <View style={[styles.header, { backgroundColor: theme.primary }]}>
+          <Text style={[styles.welcomeText, { color: theme.surface }]}>{LanguageService.t('welcome')}</Text>
+          <Text style={[styles.titleText, { color: theme.surface }]}>{userProfile?.fullName || 'DODOMA CTF 2025'}</Text>
+          <Text style={[styles.subtitleText, { color: theme.surface + 'cc' }]}>{LanguageService.t('dashboard')}</Text>
         </View>
 
         {/* Today's Status */}
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Hali ya Leo</Text>
+          <Text style={[styles.sectionTitle, { color: theme.text }]}>{LanguageService.t('todayStatus')}</Text>
           {todayReport ? (
-            <View style={styles.todayCard}>
+            <View style={[styles.todayCard, { backgroundColor: theme.card }]}>
               <View style={styles.todayHeader}>
-                <Text style={styles.todayTitle}>
-                  {DataService.getDayName(new Date())} - Leo
+                <Text style={[styles.todayTitle, { color: theme.text }]}>
+                  {LanguageService.getDayName(new Date())} - {LanguageService.t('todayStatus')}
                 </Text>
-                <View style={styles.completedBadge}>
-                  <Text style={styles.completedBadgeText}>Imekamilika</Text>
+                <View style={[styles.completedBadge, { backgroundColor: theme.success }]}>
+                  <Text style={[styles.completedBadgeText, { color: theme.surface }]}>{LanguageService.t('completed')}</Text>
                 </View>
               </View>
-              <Text style={styles.todayHours}>{todayReport.hoursWorked} masaa ya kazi</Text>
-              <Text style={styles.todayAmount}>TSH {Number(todayReport.dailyAmount || 0).toLocaleString()}</Text>
+              <Text style={[styles.todayHours, { color: theme.textSecondary }]}>{todayReport.hoursWorked} {LanguageService.t('hoursWorked')}</Text>
+              <Text style={[styles.todayAmount, { color: theme.success }]}>TSH {todayReport.dailyAmount.toLocaleString()}</Text>
             </View>
           ) : (
             <TouchableOpacity 
-              style={styles.noReportCard}
-              onPress={() => {
-                if (weekLocked) {
-                  Alert.alert('Wiki Imefungwa', 'Huwezi kutengeneza taarifa mpya kwa wiki iliyofungwa.');
-                  return;
-                }
-                router.push('/new-report');
-              }}
+              style={[
+                styles.noReportCard,
+                { backgroundColor: theme.card, borderColor: theme.border }
+              ]}
+              onPress={() => router.push('/new-report')}
+              disabled={weekStatus.status === 'locked'}
             >
-              <Plus size={32} color={weekStatus.status === 'locked' ? '#9ca3af' : '#1e3a8a'} />
+              <Plus size={32} color={weekStatus.status === 'locked' ? theme.textSecondary : theme.primary} />
               <Text style={[
                 styles.noReportText,
-                weekStatus.status === 'locked' && styles.noReportTextDisabled
+                weekStatus.status === 'locked' && styles.noReportTextDisabled,
+                { color: weekStatus.status === 'locked' ? theme.textSecondary : theme.primary }
               ]}>
-                {weekStatus.status === 'locked' ? 'Wiki Imefungwa' : 'Anza Taarifa ya Leo'}
+                {weekStatus.status === 'locked' ? LanguageService.t('weekLocked') : LanguageService.t('startTodayReport')}
               </Text>
             </TouchableOpacity>
           )}
@@ -156,28 +156,28 @@ export default function DashboardScreen() {
 
         {/* Week Status */}
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Hali ya Wiki Hii</Text>
+          <Text style={[styles.sectionTitle, { color: theme.text }]}>{LanguageService.t('weekStatus')}</Text>
           <View style={[
             styles.weekStatusCard,
-            { backgroundColor: weekStatus.status === 'locked' ? '#fef2f2' : '#f0fdf4' }
+            { backgroundColor: weekStatus.status === 'locked' ? (theme.error + '10') : (theme.success + '10') }
           ]}>
-            <Clock size={20} color={weekStatus.status === 'locked' ? '#dc2626' : '#059669'} />
+            <Clock size={20} color={weekStatus.status === 'locked' ? theme.error : theme.success} />
             <Text style={[
               styles.weekStatusText,
-              { color: weekStatus.status === 'locked' ? '#dc2626' : '#059669' }
+              { color: weekStatus.status === 'locked' ? theme.error : theme.success }
             ]}>
               {weekStatus.message}
             </Text>
           </View>
 
           {currentWeekReport && (
-            <View style={styles.currentWeekCard}>
-              <Text style={styles.currentWeekTitle}>Wiki #{currentWeekReport.weekNumber}</Text>
-              <Text style={styles.currentWeekInfo}>
-                {currentWeekReport.dailyReports.length} siku zimejazwa kati ya 6
+            <View style={[styles.currentWeekCard, { backgroundColor: theme.card }]}>
+              <Text style={[styles.currentWeekTitle, { color: theme.text }]}>{LanguageService.t('weeklyReport')} #{currentWeekReport.weekNumber}</Text>
+              <Text style={[styles.currentWeekInfo, { color: theme.textSecondary }]}>
+                {currentWeekReport.dailyReports.length} {LanguageService.t('completed')} {LanguageService.t('of') || ''} 6
               </Text>
-              <Text style={styles.currentWeekAmount}>
-                TSH {Number(currentWeekReport.totalAmount || 0).toLocaleString()}
+              <Text style={[styles.currentWeekAmount, { color: theme.success }]}>
+                TSH {currentWeekReport.totalAmount.toLocaleString()}
               </Text>
             </View>
           )}
@@ -186,21 +186,17 @@ export default function DashboardScreen() {
         {/* Missing Reports Alert */}
         {missingDates.length > 0 && (
           <View style={styles.section}>
-            <View style={styles.missingReportsCard}>
-              <AlertCircle size={20} color="#f59e0b" />
+            <View style={[styles.missingReportsCard, { backgroundColor: theme.warning + '10', borderColor: theme.warning }]}>
+              <AlertCircle size={20} color={theme.warning} />
               <View style={styles.missingReportsText}>
-                <Text style={styles.missingReportsTitle}>
-                  Taarifa {missingDates.length} hazijajazwa
-                </Text>
-                <Text style={styles.missingReportsSubtitle}>
-                  Bonyeza hapa kujaza taarifa za nyuma
-                </Text>
+                <Text style={[styles.missingReportsTitle, { color: theme.warning }]}>{LanguageService.t('missingReports')}: {missingDates.length}</Text>
+                <Text style={[styles.missingReportsSubtitle, { color: theme.warning }]}>{LanguageService.t('fillMissing')}</Text>
               </View>
               <TouchableOpacity 
-                style={styles.fillMissingButton}
+                style={[styles.fillMissingButton, { backgroundColor: theme.warning }]}
                 onPress={() => router.push('/new-report')}
               >
-                <Text style={styles.fillMissingButtonText}>Jaza</Text>
+                <Text style={styles.fillMissingButtonText}>{LanguageService.t('fillMissing')}</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -208,71 +204,58 @@ export default function DashboardScreen() {
 
         {/* Statistics Overview */}
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Muhtasari wa Takwimu</Text>
+          <Text style={[styles.sectionTitle, { color: theme.text }]}>{LanguageService.t('analyticsBoard')}</Text>
           <View style={styles.statsGrid}>
             <StatCard
-              title="Jumla ya Wiki"
+              title={LanguageService.t('reportHistory')}
               value={totalReports}
-              subtitle="Wiki zilizokamilika"
+              subtitle={LanguageService.t('weeklyReport')}
               icon={FileText}
-              color="#1e3a8a"
+              color={theme.primary}
             />
             <StatCard
-              title="Jumla ya Mauzo"
-              value={`TSH ${Number(totalSales || 0).toLocaleString()}`}
-              subtitle="Mapato yaliyopatikana"
+              title={LanguageService.t('totalSales')}
+              value={`TSH ${totalSales.toLocaleString()}`}
+              subtitle={LanguageService.t('allTimeSales')}
               icon={DollarSign}
-              color="#059669"
+              color={theme.success}
             />
             <StatCard
-              title="Vitabu Vilivyouzwa"
+              title={LanguageService.t('booksSold')}
               value={totalBooks}
-              subtitle="Vitabu vilivyosambazwa"
+              subtitle={LanguageService.t('booksDistributed')}
               icon={Book}
-              color="#dc2626"
-            />
-            <StatCard
-              title="Kiwango cha Utendaji"
-              value="87%"
-              subtitle="Kulingana na shughuli"
-              icon={TrendingUp}
-              color="#f59e0b"
+              color={theme.error}
             />
           </View>
         </View>
 
         {/* Quick Actions */}
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Vitendo vya Haraka</Text>
+          <Text style={[styles.sectionTitle, { color: theme.text }]}>{LanguageService.t('quickActions')}</Text>
           <View style={styles.quickActionsGrid}>
             <QuickAction
-              title="Taarifa Mpya"
+              title={LanguageService.t('newReport')}
               icon={Plus}
-              color="#1e3a8a"
-              onPress={() => {
-                if (weekLocked) {
-                  Alert.alert('Wiki Imefungwa', 'Huwezi kutengeneza taarifa mpya kwa wiki iliyofungwa.');
-                  return;
-                }
-                router.push('/new-report');
-              }}
+              color={theme.primary}
+              onPress={() => router.push('/new-report')}
             />
             <QuickAction
-              title="Ona Taarifa"
+              title={LanguageService.t('reports')}
               icon={FileText}
-              color="#059669"
+              color={theme.success}
               onPress={() => router.push('/reports')}
             />
             <QuickAction
-              title="Takwimu"
+              title={LanguageService.t('analytics')}
               icon={BarChart3}
-              color="#dc2626"
+              color={theme.error}
               onPress={() => router.push('/analytics')}
             />
             <QuickAction
-              title="Mipangilio"
+              title={LanguageService.t('settings')}
               icon={Settings}
-              color="#f59e0b"
+              color={theme.warning}
               onPress={() => router.push('/settings')}
             />
           </View>
@@ -285,28 +268,24 @@ export default function DashboardScreen() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#f8fafc',
+    // backgroundColor is set dynamically from theme
   },
   header: {
     padding: 24,
-    backgroundColor: '#1e3a8a',
     borderBottomLeftRadius: 24,
     borderBottomRightRadius: 24,
   },
   welcomeText: {
     fontSize: 16,
-    color: '#93c5fd',
     marginBottom: 4,
   },
   titleText: {
     fontSize: 24,
     fontWeight: 'bold',
-    color: '#ffffff',
     marginBottom: 4,
   },
   subtitleText: {
     fontSize: 14,
-    color: '#bfdbfe',
   },
   section: {
     margin: 16,
@@ -314,11 +293,9 @@ const styles = StyleSheet.create({
   sectionTitle: {
     fontSize: 18,
     fontWeight: '600',
-    color: '#1f2937',
     marginBottom: 12,
   },
   todayCard: {
-    backgroundColor: '#ffffff',
     padding: 20,
     borderRadius: 12,
     shadowColor: '#000',
@@ -336,31 +313,25 @@ const styles = StyleSheet.create({
   todayTitle: {
     fontSize: 18,
     fontWeight: '600',
-    color: '#1f2937',
   },
   completedBadge: {
-    backgroundColor: '#059669',
     paddingHorizontal: 8,
     paddingVertical: 4,
     borderRadius: 4,
   },
   completedBadgeText: {
-    color: '#ffffff',
     fontSize: 12,
     fontWeight: '600',
   },
   todayHours: {
     fontSize: 14,
-    color: '#6b7280',
     marginBottom: 4,
   },
   todayAmount: {
     fontSize: 20,
     fontWeight: 'bold',
-    color: '#059669',
   },
   noReportCard: {
-    backgroundColor: '#ffffff',
     padding: 32,
     borderRadius: 12,
     alignItems: 'center',
@@ -370,17 +341,15 @@ const styles = StyleSheet.create({
     shadowRadius: 4,
     elevation: 3,
     borderWidth: 2,
-    borderColor: '#e5e7eb',
     borderStyle: 'dashed',
   },
   noReportText: {
     fontSize: 16,
     fontWeight: '600',
-    color: '#1e3a8a',
     marginTop: 12,
   },
   noReportTextDisabled: {
-    color: '#9ca3af',
+    opacity: 0.7,
   },
   weekStatusCard: {
     flexDirection: 'row',
@@ -395,7 +364,6 @@ const styles = StyleSheet.create({
     marginLeft: 8,
   },
   currentWeekCard: {
-    backgroundColor: '#ffffff',
     padding: 16,
     borderRadius: 8,
     shadowColor: '#000',
@@ -407,27 +375,22 @@ const styles = StyleSheet.create({
   currentWeekTitle: {
     fontSize: 16,
     fontWeight: '600',
-    color: '#1f2937',
     marginBottom: 4,
   },
   currentWeekInfo: {
     fontSize: 14,
-    color: '#6b7280',
     marginBottom: 4,
   },
   currentWeekAmount: {
     fontSize: 18,
     fontWeight: 'bold',
-    color: '#059669',
   },
   missingReportsCard: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#fffbeb',
     padding: 16,
     borderRadius: 8,
     borderWidth: 1,
-    borderColor: '#fbbf24',
   },
   missingReportsText: {
     flex: 1,
@@ -436,22 +399,19 @@ const styles = StyleSheet.create({
   missingReportsTitle: {
     fontSize: 16,
     fontWeight: '600',
-    color: '#92400e',
     marginBottom: 2,
   },
   missingReportsSubtitle: {
     fontSize: 14,
-    color: '#a16207',
   },
   fillMissingButton: {
-    backgroundColor: '#f59e0b',
     paddingHorizontal: 12,
     paddingVertical: 6,
     borderRadius: 6,
   },
   fillMissingButtonText: {
-    color: '#ffffff',
     fontWeight: '600',
+    color: '#fff',
   },
   statsGrid: {
     flexDirection: 'row',
@@ -459,7 +419,6 @@ const styles = StyleSheet.create({
     marginHorizontal: -6,
   },
   statCard: {
-    backgroundColor: '#ffffff',
     padding: 16,
     borderRadius: 12,
     margin: 6,
@@ -479,18 +438,15 @@ const styles = StyleSheet.create({
   statTitle: {
     fontSize: 14,
     fontWeight: '500',
-    color: '#6b7280',
     marginLeft: 8,
   },
   statValue: {
     fontSize: 20,
     fontWeight: 'bold',
-    color: '#1f2937',
     marginBottom: 4,
   },
   statSubtitle: {
     fontSize: 12,
-    color: '#9ca3af',
   },
   quickActionsGrid: {
     flexDirection: 'row',
@@ -498,7 +454,6 @@ const styles = StyleSheet.create({
     marginHorizontal: -8,
   },
   quickAction: {
-    backgroundColor: '#ffffff',
     padding: 20,
     borderRadius: 12,
     margin: 8,
@@ -513,7 +468,6 @@ const styles = StyleSheet.create({
   quickActionText: {
     fontSize: 14,
     fontWeight: '600',
-    color: '#1f2937',
     marginTop: 8,
     textAlign: 'center',
   },

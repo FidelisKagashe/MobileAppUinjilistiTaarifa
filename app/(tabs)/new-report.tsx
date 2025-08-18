@@ -1,4 +1,5 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+// app/(tabs)/new-report.tsx
+import React, { useEffect, useState } from 'react';
 import {
   View,
   Text,
@@ -12,15 +13,17 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Save, Plus, Trash2, Calendar, Clock } from 'lucide-react-native';
-import { useForm, Controller, FieldErrors, Path } from 'react-hook-form';
+import { useForm, Controller } from 'react-hook-form';
 import { yupResolver } from '@hookform/resolvers/yup';
 import * as yup from 'yup';
 import { DataService } from '@/services/DataService';
+import { LanguageService } from '@/services/LanguageService';
 import { DailyReport, BookSale, UserProfile } from '@/types/Report';
 import { router } from 'expo-router';
+import { useTheme } from '../providers/ThemeProvider';
 
-// -- types
-type FormValues = {
+// --- Defaults & validation ---
+type FormData = {
   hoursWorked: number;
   booksSold: number;
   dailyAmount: number;
@@ -35,28 +38,47 @@ type FormValues = {
   peopleVisited: number;
 };
 
-// -- validation
+const DEFAULT_VALUES: FormData = {
+  hoursWorked: 0,
+  booksSold: 0,
+  dailyAmount: 0,
+  freeLiterature: 0,
+  vopActivities: 0,
+  churchAttendees: 0,
+  backSlidesVisited: 0,
+  prayersOffered: 0,
+  bibleStudies: 0,
+  baptismCandidates: 0,
+  baptismsPerformed: 0,
+  peopleVisited: 0,
+};
+
 const schema = yup.object().shape({
-  hoursWorked: yup.number().min(0, 'Masaa lazima yawe mazuri').required('Masaa ya kazi yanahitajika'),
-  booksSold: yup.number().min(0, 'Vitabu vilivyouzwa lazima viwe mazuri').required(),
-  dailyAmount: yup.number().min(0, 'Kiasi lazima kiwe kizuri').required(),
-  freeLiterature: yup.number().min(0, 'Vitabu vya bure lazima viwe mazuri').required(),
-  vopActivities: yup.number().min(0, 'Shughuli za VOP lazima ziwe nzuri').required(),
-  churchAttendees: yup.number().min(0, 'Watu waliofika kanisani lazima wawe wazuri').required(),
-  backSlidesVisited: yup.number().min(0, 'Waliotembelewa lazima wawe wazuri').required(),
-  prayersOffered: yup.number().min(0, 'Maombi yaliyotolewa lazima yawe mazuri').required(),
-  bibleStudies: yup.number().min(0, 'Masomo ya Biblia lazima yawe mazuri').required(),
-  baptismCandidates: yup.number().min(0, 'Wagombea ubatizo lazima wawe wazuri').required(),
-  baptismsPerformed: yup.number().min(0, 'Mabatizo yaliyofanywa lazima yawe mazuri').required(),
-  peopleVisited: yup.number().min(0, 'Watu waliotembelewa lazima wawe wazuri').required(),
+  hoursWorked: yup.number().min(0).required(),
+  booksSold: yup.number().min(0).required(),
+  dailyAmount: yup.number().min(0).required(),
+  freeLiterature: yup.number().min(0).required(),
+  vopActivities: yup.number().min(0).required(),
+  churchAttendees: yup.number().min(0).required(),
+  backSlidesVisited: yup.number().min(0).required(),
+  prayersOffered: yup.number().min(0).required(),
+  bibleStudies: yup.number().min(0).required(),
+  baptismCandidates: yup.number().min(0).required(),
+  baptismsPerformed: yup.number().min(0).required(),
+  peopleVisited: yup.number().min(0).required(),
 });
 
 export default function NewReportScreen() {
+  const { theme } = useTheme();
+
   const [bookSales, setBookSales] = useState<BookSale[]>([]);
   const [loading, setLoading] = useState(false);
-  const [selectedDate, setSelectedDate] = useState(new Date().toISOString().split('T')[0]);
+  const [selectedDate, setSelectedDate] = useState<string>(new Date().toISOString().split('T')[0]);
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [existingReport, setExistingReport] = useState<DailyReport | null>(null);
+
+  // small tick to force rerender on language change
+  const [langTick, setLangTick] = useState(0);
 
   const {
     control,
@@ -65,48 +87,38 @@ export default function NewReportScreen() {
     setValue,
     watch,
     reset,
-  } = useForm<FormValues>({
+  } = useForm<FormData>({
     resolver: yupResolver(schema),
-    defaultValues: {
-      hoursWorked: 0,
-      booksSold: 0,
-      dailyAmount: 0,
-      freeLiterature: 0,
-      vopActivities: 0,
-      churchAttendees: 0,
-      backSlidesVisited: 0,
-      prayersOffered: 0,
-      bibleStudies: 0,
-      baptismCandidates: 0,
-      baptismsPerformed: 0,
-      peopleVisited: 0,
-    },
+    defaultValues: DEFAULT_VALUES,
   });
 
-  // keep watch values handy
-  const watchedBooksSold = watch('booksSold');
-  const watchedDailyAmount = watch('dailyAmount');
-
+  // Initialize services on mount
   useEffect(() => {
-    loadUserProfile();
-    // load selected date report on mount as well
-    loadReportForDate(selectedDate);
+    (async () => {
+      await DataService.initialize();
+      await LanguageService.initialize();
+      await DataService.setFirstUseDate();
+      loadUserProfile();
+
+      // subscribe to language changes to re-render UI
+      const unsubscribe = LanguageService.subscribe(() => setLangTick((t) => t + 1));
+      return unsubscribe;
+    })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Load report when selectedDate changes
   useEffect(() => {
-    // recalc totals when bookSales change
-    const totalAmount = bookSales.reduce((sum, sale) => sum + (Number(sale.price) || 0) * (Number(sale.quantity) || 0), 0);
-    const totalBooks = bookSales.reduce((sum, sale) => sum + (Number(sale.quantity) || 0), 0);
-    // ensure numbers are set in form
+    loadReportForDate(selectedDate);
+  }, [selectedDate]);
+
+  // Recalculate totals when bookSales change
+  useEffect(() => {
+    const totalAmount = bookSales.reduce((sum, sale) => sum + (sale.price || 0) * (sale.quantity || 0), 0);
+    const totalBooks = bookSales.reduce((sum, sale) => sum + (sale.quantity || 0), 0);
     setValue('dailyAmount', totalAmount);
     setValue('booksSold', totalBooks);
   }, [bookSales, setValue]);
-
-  useEffect(() => {
-    // when selectedDate changes, load the report
-    loadReportForDate(selectedDate);
-  }, [selectedDate]);
 
   const loadUserProfile = async () => {
     try {
@@ -117,50 +129,36 @@ export default function NewReportScreen() {
     }
   };
 
-  const loadReportForDate = useCallback(async (date: string) => {
+  const loadReportForDate = async (date: string) => {
     try {
       const report = await DataService.getDailyReportByDate(date);
       if (report) {
         setExistingReport(report);
-        // ensure bookSales numbers are numbers
-        const normalized = report.bookSales?.map((s) => ({ ...s, price: Number(s.price) || 0, quantity: Number(s.quantity) || 0 })) || [];
-        setBookSales(normalized);
+        setBookSales(Array.isArray(report.bookSales) ? report.bookSales : []);
+
         reset({
-          hoursWorked: report.hoursWorked || 0,
-          booksSold: report.booksSold || 0,
-          dailyAmount: report.dailyAmount || 0,
-          freeLiterature: report.freeLiterature || 0,
-          vopActivities: report.vopActivities || 0,
-          churchAttendees: report.churchAttendees || 0,
-          backSlidesVisited: report.backSlidesVisited || 0,
-          prayersOffered: report.prayersOffered || 0,
-          bibleStudies: report.bibleStudies || 0,
-          baptismCandidates: report.baptismCandidates || 0,
-          baptismsPerformed: report.baptismsPerformed || 0,
-          peopleVisited: report.peopleVisited || 0,
+          hoursWorked: report.hoursWorked ?? 0,
+          booksSold: report.booksSold ?? 0,
+          dailyAmount: report.dailyAmount ?? 0,
+          freeLiterature: report.freeLiterature ?? 0,
+          vopActivities: report.vopActivities ?? 0,
+          churchAttendees: report.churchAttendees ?? 0,
+          backSlidesVisited: report.backSlidesVisited ?? 0,
+          prayersOffered: report.prayersOffered ?? 0,
+          bibleStudies: report.bibleStudies ?? 0,
+          baptismCandidates: report.baptismCandidates ?? 0,
+          baptismsPerformed: report.baptismsPerformed ?? 0,
+          peopleVisited: report.peopleVisited ?? 0,
         });
       } else {
         setExistingReport(null);
         setBookSales([]);
-        reset({
-          hoursWorked: 0,
-          booksSold: 0,
-          dailyAmount: 0,
-          freeLiterature: 0,
-          vopActivities: 0,
-          churchAttendees: 0,
-          backSlidesVisited: 0,
-          prayersOffered: 0,
-          bibleStudies: 0,
-          baptismCandidates: 0,
-          baptismsPerformed: 0,
-          peopleVisited: 0,
-        });
+        reset(DEFAULT_VALUES);
       }
     } catch (error) {
       console.error('Error loading report for date:', error);
     }
-  }, [reset]);
+  };
 
   const addBookSale = () => {
     setBookSales((prev) => [
@@ -174,58 +172,77 @@ export default function NewReportScreen() {
   };
 
   const removeBookSale = (id: string) => {
-    Alert.alert('Thibitisha', 'Unataka kuondoa kitabu hiki?', [
-      { text: 'Hapana' },
-      { text: 'Ndiyo', onPress: () => setBookSales((prev) => prev.filter((s) => s.id !== id)) },
-    ]);
+    setBookSales((prev) => prev.filter((sale) => sale.id !== id));
   };
 
-  const onSubmit = async (data: FormValues) => {
+  const onSubmit = async (data: any) => {
     if (!userProfile) {
-      Alert.alert('Hitilafu', 'Wasifu wa mtumiaji haujapatikana');
+      Alert.alert(LanguageService.t('error'), LanguageService.t('validationError'));
+      return;
+    }
+
+    const reportDate = new Date(selectedDate);
+    const weekStart = DataService.getWeekStartDate(reportDate);
+    const isLocked = DataService.isWeekLocked(weekStart);
+
+    if (isLocked && !existingReport) {
+      Alert.alert(LanguageService.t('weekLocked'), LanguageService.t('weekLocked'));
       return;
     }
 
     setLoading(true);
+
     try {
-      const reportDate = new Date(selectedDate);
-      const weekStart = DataService.getWeekStartDate(reportDate);
-      const isLocked = await DataService.isWeekLocked(weekStart);
-
-      if (isLocked && !existingReport) {
-        Alert.alert('Wiki Imefungwa', 'Huwezi kutengeneza taarifa mpya kwa wiki iliyofungwa. Unaweza tu kubadilisha taarifa zilizopo.', [
-          { text: 'Sawa' },
-        ]);
-        setLoading(false);
-        return;
-      }
-
-      // normalize bookSales to ensure numbers
-      const normalizedBookSales = bookSales.map((s) => ({ ...s, price: Number(s.price) || 0, quantity: Number(s.quantity) || 0 }));
+      const safeNumber = (v: any) => {
+        const n = Number(v);
+        return Number.isNaN(n) ? 0 : n;
+      };
 
       const report: DailyReport = {
-        ...data,
         id: existingReport?.id || `daily_${selectedDate}_${Date.now()}`,
         date: selectedDate,
         studentName: userProfile.fullName,
         phoneNumber: userProfile.phoneNumber,
-        bookSales: normalizedBookSales,
+        hoursWorked: safeNumber(data.hoursWorked),
+        booksSold: safeNumber(data.booksSold),
+        dailyAmount: safeNumber(data.dailyAmount),
+        freeLiterature: safeNumber(data.freeLiterature),
+        vopActivities: safeNumber(data.vopActivities),
+        churchAttendees: safeNumber(data.churchAttendees),
+        backSlidesVisited: safeNumber(data.backSlidesVisited),
+        prayersOffered: safeNumber(data.prayersOffered),
+        bibleStudies: safeNumber(data.bibleStudies),
+        baptismCandidates: safeNumber(data.baptismCandidates),
+        baptismsPerformed: safeNumber(data.baptismsPerformed),
+        peopleVisited: safeNumber(data.peopleVisited),
+        bookSales: Array.isArray(bookSales) ? bookSales : [],
         createdAt: existingReport?.createdAt || new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
 
       await DataService.saveDailyReport(report);
 
-      // refresh local state before navigation
-      setExistingReport(report);
-      await loadReportForDate(selectedDate);
+      // verification readback
+      const saved = await DataService.getDailyReportByDate(selectedDate);
+      if (!saved) throw new Error(LanguageService.t('networkError'));
 
-      Alert.alert('Imehifadhiwa!', `Taarifa ya ${DataService.getDayName(new Date(selectedDate))} imehifadhiwa kikamilifu!`, [
-        { text: 'Sawa', onPress: () => router.push('/') },
+      // update UI
+      setExistingReport(saved);
+      setBookSales(Array.isArray(saved.bookSales) ? saved.bookSales : []);
+
+      Alert.alert(LanguageService.t('success'), LanguageService.t('reportSaved'), [
+        {
+          text: LanguageService.t('ok'),
+          onPress: () => {
+            reset(DEFAULT_VALUES);
+            setBookSales([]);
+            router.push('/');
+          },
+        },
       ]);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error saving daily report:', error);
-      Alert.alert('Hitilafu', 'Imeshindwa kuhifadhi taarifa. Jaribu tena.');
+      Alert.alert(LanguageService.t('error'), error?.message || LanguageService.t('networkError'));
     } finally {
       setLoading(false);
     }
@@ -233,31 +250,40 @@ export default function NewReportScreen() {
 
   const DateSelector = () => {
     const today = new Date();
+    const weekStart = DataService.getWeekStartDate(today);
     const dates: Date[] = [];
 
-    for (let i = 5; i >= 0; i--) {
-      const date = new Date(today);
-      date.setDate(date.getDate() - i);
-      dates.push(date);
+    for (let i = 0; i < 6; i++) {
+      const date = new Date(weekStart);
+      date.setDate(date.getDate() + i);
+      const dayOfWeek = date.getDay();
+      if (dayOfWeek >= 0 && dayOfWeek <= 5) dates.push(date);
     }
 
     return (
       <View style={styles.dateSelector}>
-        <Text style={styles.dateSelectorTitle}>Chagua Tarehe:</Text>
+        <Text style={[styles.dateSelectorTitle, { color: theme.text }]}>{LanguageService.t('selectDay')}</Text>
         <ScrollView horizontal showsHorizontalScrollIndicator={false}>
           {dates.map((date) => {
             const dateString = date.toISOString().split('T')[0];
             const isSelected = dateString === selectedDate;
-            const dayName = DataService.getDayName(date);
-
+            const dayName = LanguageService.getDayName(date);
+            const isToday = dateString === new Date().toISOString().split('T')[0];
             return (
               <TouchableOpacity
                 key={dateString}
-                style={[styles.dateButton, isSelected && styles.dateButtonSelected]}
+                style={[
+                  styles.dateButton,
+                  {
+                    backgroundColor: isSelected ? theme.primary : theme.card,
+                    borderColor: isSelected ? theme.primary : theme.border,
+                  },
+                  isToday ? { borderColor: theme.success, borderWidth: 2 } : null,
+                ]}
                 onPress={() => setSelectedDate(dateString)}
               >
-                <Text style={[styles.dateDayName, isSelected && styles.dateTextSelected]}>{dayName}</Text>
-                <Text style={[styles.dateNumber, isSelected && styles.dateTextSelected]}>{date.getDate()}</Text>
+                <Text style={[styles.dateDayName, { color: isSelected ? theme.surface : theme.textSecondary, fontWeight: isToday ? '700' : '400' }]}>{dayName.substring(0, 3)}</Text>
+                <Text style={[styles.dateNumber, { color: isSelected ? theme.surface : theme.text }]}>{date.getDate()}</Text>
               </TouchableOpacity>
             );
           })}
@@ -266,174 +292,134 @@ export default function NewReportScreen() {
     );
   };
 
-  const InputField = ({
-    name,
-    label,
-    placeholder,
-    keyboardType = 'default',
-    multiline = false,
-  }: {
-    name: keyof FormValues;
-    label: string;
-    placeholder?: string;
-    keyboardType?: any;
-    multiline?: boolean;
-  }) => (
+  const InputField = ({ name, label, placeholder, keyboardType = 'default', multiline = false }: { name: keyof FormData; label: string; placeholder: string; keyboardType?: any; multiline?: boolean; }) => (
     <View style={styles.inputGroup}>
-      <Text style={styles.inputLabel}>{label}</Text>
+      <Text style={[styles.inputLabel, { color: theme.text }]}>{label}</Text>
       <Controller
         control={control}
-        name={name as Path<FormValues>}
+        name={name}
         render={({ field: { onChange, onBlur, value } }) => (
           <TextInput
-            style={[styles.input, (errors as FieldErrors<FormValues>)[name] && styles.inputError]}
+            style={[styles.input, (errors as any)[name] && styles.inputError, { backgroundColor: theme.card, borderColor: theme.border, color: theme.text }]}
             onBlur={onBlur}
-            onChangeText={(text) => {
-              // remove commas then parse number; empty string -> 0
-              const cleaned = text.replace(/,/g, '');
-              const parsed = cleaned === '' ? 0 : Number(cleaned);
-              onChange(isNaN(parsed) ? 0 : parsed);
-            }}
-            value={value !== undefined && value !== null ? String(value) : ''}
+            onChangeText={(text) => onChange(text)}
+            value={value?.toString()}
             placeholder={placeholder}
+            placeholderTextColor={theme.textSecondary}
             keyboardType={keyboardType}
             multiline={multiline}
           />
         )}
       />
-      {(errors as FieldErrors<FormValues>)[name] && (
-        <Text style={styles.errorText}>{(errors as FieldErrors<FormValues>)[name]?.message as string}</Text>
-      )}
+      {(errors as any)[name] && <Text style={[styles.errorText, { color: theme.error }]}>{(errors as any)[name]?.message}</Text>}
     </View>
   );
 
-  // format helper to show money nicely without breaking layout
-  const formatNumber = useCallback((n?: number) => {
-    try {
-      return (Number(n) || 0).toLocaleString();
-    } catch {
-      return String(n ?? 0);
-    }
-  }, []);
-
   return (
-    <SafeAreaView style={styles.container}>
+    <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
       <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={styles.keyboardAvoid}>
         <ScrollView showsVerticalScrollIndicator={false}>
-          {/* Header */}
-          <View style={styles.header}>
-            <Text style={styles.headerTitle}>Taarifa ya Kila Siku</Text>
-            <Text style={styles.headerSubtitle}>{existingReport ? 'Badilisha taarifa' : 'Tengeneza taarifa mpya'}</Text>
+          <View style={[styles.header, { backgroundColor: theme.primary }]}>
+            <Text style={[styles.headerTitle, { color: theme.surface }]}>{LanguageService.t('dailyReport')}</Text>
+            <Text style={[styles.headerSubtitle, { color: theme.surface + 'cc' }]}>{existingReport ? LanguageService.t('updateReport') : LanguageService.t('saveReport')}</Text>
           </View>
 
           <View style={styles.formContainer}>
             <DateSelector />
 
-            <View style={styles.currentDateInfo}>
-              <Calendar size={20} color="#1e3a8a" />
-              <Text style={styles.currentDateText}>
-                {DataService.getDayName(new Date(selectedDate))} - {new Date(selectedDate).toLocaleDateString()}
-              </Text>
+            <View style={[styles.currentDateInfo, { backgroundColor: theme.card, borderColor: theme.border }]}>
+              <Calendar size={20} color={theme.primary} />
+              <Text style={[styles.currentDateText, { color: theme.text }]}>{LanguageService.getDayName(new Date(selectedDate))} - {new Date(selectedDate).toLocaleDateString()}</Text>
               {existingReport && (
-                <View style={styles.existingBadge}>
-                  <Text style={styles.existingBadgeText}>Tayari Imejazwa</Text>
+                <View style={[styles.existingBadge, { backgroundColor: theme.success }]}>
+                  <Text style={[styles.existingBadgeText, { color: theme.surface }]}>{LanguageService.t('completed')}</Text>
                 </View>
               )}
             </View>
 
             <View style={styles.formSection}>
-              <Text style={styles.formSectionTitle}>Masaa ya Kazi</Text>
-              <InputField name="hoursWorked" label="Masaa ya Kazi Leo" placeholder="0" keyboardType="numeric" />
+              <Text style={[styles.formSectionTitle, { color: theme.text }]}>{LanguageService.t('workHours')}</Text>
+              <InputField name="hoursWorked" label={LanguageService.t('workHours')} placeholder="0" keyboardType="numeric" />
             </View>
 
             <View style={styles.formSection}>
               <View style={styles.sectionHeader}>
-                <Text style={styles.formSectionTitle}>Uuzaji wa Vitabu</Text>
-                <TouchableOpacity style={styles.addButton} onPress={addBookSale}>
-                  <Plus size={20} color="#ffffff" />
-                  <Text style={styles.addButtonText}>Ongeza Kitabu</Text>
+                <Text style={[styles.formSectionTitle, { color: theme.text }]}>{LanguageService.t('bookSales')}</Text>
+                <TouchableOpacity style={[styles.addButton, { backgroundColor: theme.primary }]} onPress={addBookSale}>
+                  <Plus size={20} color={theme.surface} />
+                  <Text style={[styles.addButtonText, { color: theme.surface }]}>{LanguageService.t('addBook')}</Text>
                 </TouchableOpacity>
               </View>
 
               {bookSales.map((sale) => (
-                <View key={sale.id} style={styles.bookSaleCard}>
+                <View key={sale.id} style={[styles.bookSaleCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
                   <View style={styles.bookSaleHeader}>
-                    <Text style={styles.bookSaleTitle}>{sale.title ? sale.title : 'Kitabu'}</Text>
+                    <Text style={[styles.bookSaleTitle, { color: theme.text }]}>{LanguageService.t('bookTitle')}</Text>
                     <TouchableOpacity onPress={() => removeBookSale(sale.id)}>
-                      <Trash2 size={20} color="#dc2626" />
+                      <Trash2 size={20} color={theme.error} />
                     </TouchableOpacity>
                   </View>
 
                   <TextInput
-                    style={styles.input}
-                    placeholder="Jina la kitabu"
+                    style={[styles.input, { backgroundColor: theme.card, borderColor: theme.border, color: theme.text }]}
+                    placeholder={LanguageService.t('bookTitle')}
+                    placeholderTextColor={theme.textSecondary}
                     value={sale.title}
                     onChangeText={(text) => updateBookSale(sale.id, 'title', text)}
                   />
 
                   <View style={styles.bookSaleRow}>
                     <View style={styles.bookSaleField}>
-                      <Text style={styles.inputLabel}>Bei (TSH)</Text>
-                      <TextInput
-                        style={styles.input}
-                        placeholder="0"
-                        keyboardType="numeric"
-                        value={String(sale.price ?? 0)}
-                        onChangeText={(text) => updateBookSale(sale.id, 'price', parseFloat(text.replace(/,/g, '')) || 0)}
-                      />
+                      <Text style={[styles.inputLabel, { color: theme.text }]}>{LanguageService.t('price')}</Text>
+                      <TextInput style={[styles.input, { backgroundColor: theme.card, borderColor: theme.border, color: theme.text }]} placeholder="0" keyboardType="numeric" value={sale.price?.toString()} onChangeText={(text) => updateBookSale(sale.id, 'price', parseFloat(text) || 0)} />
                     </View>
                     <View style={styles.bookSaleField}>
-                      <Text style={styles.inputLabel}>Idadi</Text>
-                      <TextInput
-                        style={styles.input}
-                        placeholder="0"
-                        keyboardType="numeric"
-                        value={String(sale.quantity ?? 0)}
-                        onChangeText={(text) => updateBookSale(sale.id, 'quantity', parseInt(text) || 0)}
-                      />
+                      <Text style={[styles.inputLabel, { color: theme.text }]}>{LanguageService.t('quantity')}</Text>
+                      <TextInput style={[styles.input, { backgroundColor: theme.card, borderColor: theme.border, color: theme.text }]} placeholder="1" keyboardType="numeric" value={sale.quantity?.toString()} onChangeText={(text) => updateBookSale(sale.id, 'quantity', parseInt(text) || 1)} />
                     </View>
                   </View>
 
-                  <Text style={styles.bookSaleTotal}>Jumla: TSH {formatNumber((Number(sale.price) || 0) * (Number(sale.quantity) || 0))}</Text>
+                  <Text style={[styles.bookSaleTotal, { color: theme.success }]}>{LanguageService.t('total')}: TSH {((sale.price || 0) * (sale.quantity || 0)).toLocaleString()}</Text>
                 </View>
               ))}
 
-              <View style={styles.salesSummary}>
-                <Text style={styles.salesSummaryText}>
-                  Jumla ya Vitabu: {String(watchedBooksSold)} | Jumla ya Fedha: TSH {formatNumber(watchedDailyAmount)}
-                </Text>
+              <View style={[styles.salesSummary, { backgroundColor: theme.primary }]}>
+                <Text style={[styles.salesSummaryText, { color: theme.surface }]}>{LanguageService.t('booksSold')}: {watch('booksSold')} | {LanguageService.t('totalSales')}: TSH {Number(watch('dailyAmount') || 0).toLocaleString()}</Text>
               </View>
             </View>
 
             <View style={styles.formSection}>
-              <Text style={styles.formSectionTitle}>Usambazaji wa Vitabu</Text>
-              <InputField name="freeLiterature" label="Magazeti/Vitabu vya Bure Vilivyosambazwa" placeholder="0" keyboardType="numeric" />
-              <InputField name="vopActivities" label="Shughuli za VOP (Voice of Prophecy)" placeholder="0" keyboardType="numeric" />
+              <Text style={[styles.formSectionTitle, { color: theme.text }]}>{LanguageService.t('literatureDistribution')}</Text>
+              <InputField name="freeLiterature" label={LanguageService.t('freeLiterature')} placeholder="0" keyboardType="numeric" />
+              <InputField name="vopActivities" label={LanguageService.t('vopActivities')} placeholder="0" keyboardType="numeric" />
             </View>
 
             <View style={styles.formSection}>
-              <Text style={styles.formSectionTitle}>Shughuli za Uongozaji</Text>
-              <InputField name="churchAttendees" label="Watu Waliofika Kanisani" placeholder="0" keyboardType="numeric" />
-              <InputField name="backSlidesVisited" label="Waliorudi Nyuma Waliotembelewa" placeholder="0" keyboardType="numeric" />
-              <InputField name="prayersOffered" label="Maombi Yaliyotolewa" placeholder="0" keyboardType="numeric" />
-              <InputField name="bibleStudies" label="Masomo ya Biblia Yaliyofundishwa" placeholder="0" keyboardType="numeric" />
-              <InputField name="baptismCandidates" label="Watu Waliojiunga kwa Ubatizo" placeholder="0" keyboardType="numeric" />
-              <InputField name="baptismsPerformed" label="Batizo zilizofanyika" placeholder="0" keyboardType="numeric" />
-              <InputField name="peopleVisited" label="Idadi ya Watu Waliotembelewa" placeholder="0" keyboardType="numeric" />
+              <Text style={[styles.formSectionTitle, { color: theme.text }]}>{LanguageService.t('ministryActivities')}</Text>
+              <InputField name="churchAttendees" label={LanguageService.t('churchAttendees')} placeholder="0" keyboardType="numeric" />
+              <InputField name="backSlidesVisited" label={LanguageService.t('backSlidesVisited')} placeholder="0" keyboardType="numeric" />
+              <InputField name="prayersOffered" label={LanguageService.t('prayersOffered')} placeholder="0" keyboardType="numeric" />
+              <InputField name="bibleStudies" label={LanguageService.t('bibleStudies')} placeholder="0" keyboardType="numeric" />
+              <InputField name="baptismCandidates" label={LanguageService.t('baptismCandidates')} placeholder="0" keyboardType="numeric" />
+              <InputField name="baptismsPerformed" label={LanguageService.t('baptismsPerformed')} placeholder="0" keyboardType="numeric" />
+              <InputField name="peopleVisited" label={LanguageService.t('peopleVisited')} placeholder="0" keyboardType="numeric" />
             </View>
 
-            <View style={styles.autoSaveInfo}>
-              <Clock size={16} color="#059669" />
-              <Text style={styles.autoSaveText}>Taarifa itahifadhiwa moja kwa moja baada ya kubonyeza "Hifadhi"</Text>
+            <View style={[styles.autoSaveInfo, { backgroundColor: theme.success + '10' }]}>
+              <Clock size={16} color={theme.success} />
+              <Text style={[styles.autoSaveText, { color: theme.success }]}>{LanguageService.t('saveReport')}</Text>
             </View>
 
             <TouchableOpacity
-              style={[styles.submitButton, loading && styles.submitButtonDisabled]}
+              style={[
+                styles.submitButton,
+                loading ? { backgroundColor: theme.textSecondary } : { backgroundColor: theme.success }
+              ]}
               onPress={handleSubmit(onSubmit)}
               disabled={loading}
             >
-              <Save size={20} color="#ffffff" />
-              <Text style={styles.submitButtonText}>{loading ? 'Inahifadhi...' : existingReport ? 'Sasisha Taarifa' : 'Hifadhi Taarifa'}</Text>
+              <Save size={20} color={theme.surface} />
+              <Text style={[styles.submitButtonText, { color: theme.surface }]}>{loading ? LanguageService.t('loading') : (existingReport ? LanguageService.t('updateReport') : LanguageService.t('saveReport'))}</Text>
             </TouchableOpacity>
           </View>
         </ScrollView>
@@ -443,227 +429,43 @@ export default function NewReportScreen() {
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#f8fafc',
-  },
-  keyboardAvoid: {
-    flex: 1,
-  },
-  header: {
-    padding: 24,
-    backgroundColor: '#1e3a8a',
-  },
-  headerTitle: {
-    fontSize: 24,
-    fontWeight: 'bold',
-    color: '#ffffff',
-    marginBottom: 4,
-  },
-  headerSubtitle: {
-    fontSize: 14,
-    color: '#bfdbfe',
-  },
-  formContainer: {
-    padding: 16,
-  },
-  dateSelector: {
-    marginBottom: 20,
-  },
-  dateSelectorTitle: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#1f2937',
-    marginBottom: 12,
-  },
-  dateButton: {
-    backgroundColor: '#ffffff',
-    padding: 12,
-    borderRadius: 8,
-    marginRight: 8,
-    alignItems: 'center',
-    minWidth: 60,
-    borderWidth: 1,
-    borderColor: '#e5e7eb',
-  },
-  dateButtonSelected: {
-    backgroundColor: '#1e3a8a',
-    borderColor: '#1e3a8a',
-  },
-  dateDayName: {
-    fontSize: 12,
-    color: '#6b7280',
-    marginBottom: 4,
-  },
-  dateNumber: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#1f2937',
-  },
-  dateTextSelected: {
-    color: '#ffffff',
-  },
-  currentDateInfo: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#ffffff',
-    padding: 16,
-    borderRadius: 8,
-    marginBottom: 20,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.05,
-    shadowRadius: 2,
-    elevation: 2,
-  },
-  currentDateText: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#1f2937',
-    marginLeft: 8,
-    flex: 1,
-  },
-  existingBadge: {
-    backgroundColor: '#059669',
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 4,
-  },
-  existingBadgeText: {
-    color: '#ffffff',
-    fontSize: 12,
-    fontWeight: '600',
-  },
-  formSection: {
-    marginBottom: 24,
-  },
-  formSectionTitle: {
-    fontSize: 18,
-    fontWeight: '600',
-    color: '#1f2937',
-    marginBottom: 16,
-  },
-  sectionHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 16,
-  },
-  inputGroup: {
-    marginBottom: 16,
-  },
-  inputLabel: {
-    fontSize: 14,
-    fontWeight: '500',
-    color: '#374151',
-    marginBottom: 6,
-  },
-  input: {
-    backgroundColor: '#ffffff',
-    borderWidth: 1,
-    borderColor: '#d1d5db',
-    borderRadius: 8,
-    padding: 12,
-    fontSize: 16,
-    color: '#1f2937',
-  },
-  inputError: {
-    borderColor: '#dc2626',
-  },
-  errorText: {
-    fontSize: 12,
-    color: '#dc2626',
-    marginTop: 4,
-  },
-  addButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#1e3a8a',
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    borderRadius: 6,
-  },
-  addButtonText: {
-    color: '#ffffff',
-    fontWeight: '600',
-    marginLeft: 6,
-  },
-  bookSaleCard: {
-    backgroundColor: '#ffffff',
-    padding: 16,
-    borderRadius: 12,
-    marginBottom: 12,
-    borderWidth: 1,
-    borderColor: '#e5e7eb',
-  },
-  bookSaleHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 12,
-  },
-  bookSaleTitle: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#1f2937',
-  },
-  bookSaleRow: {
-    flexDirection: 'row',
-    marginHorizontal: -6,
-  },
-  bookSaleField: {
-    flex: 1,
-    marginHorizontal: 6,
-  },
-  bookSaleTotal: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#059669',
-    textAlign: 'right',
-    marginTop: 8,
-  },
-  salesSummary: {
-    backgroundColor: '#1e3a8a',
-    padding: 16,
-    borderRadius: 8,
-    marginTop: 12,
-  },
-  salesSummaryText: {
-    color: '#ffffff',
-    fontWeight: '600',
-    textAlign: 'center',
-  },
-  autoSaveInfo: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#f0fdf4',
-    padding: 12,
-    borderRadius: 8,
-    marginBottom: 16,
-  },
-  autoSaveText: {
-    fontSize: 14,
-    color: '#059669',
-    marginLeft: 8,
-    flex: 1,
-  },
-  submitButton: {
-    backgroundColor: '#059669',
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: 16,
-    borderRadius: 12,
-    marginTop: 24,
-    marginBottom: 32,
-  },
-  submitButtonDisabled: {
-    backgroundColor: '#9ca3af',
-  },
-  submitButtonText: {
-    color: '#ffffff',
-    fontSize: 16,
-    fontWeight: '600',
-    marginLeft: 8,
-  },
+  container: { flex: 1 },
+  keyboardAvoid: { flex: 1 },
+  header: { padding: 24 },
+  headerTitle: { fontSize: 24, fontWeight: 'bold', marginBottom: 4 },
+  headerSubtitle: { fontSize: 14 },
+  formContainer: { padding: 16 },
+  dateSelector: { marginBottom: 20 },
+  dateSelectorTitle: { fontSize: 16, fontWeight: '600', marginBottom: 12 },
+  dateButton: { padding: 12, borderRadius: 8, marginRight: 8, alignItems: 'center', minWidth: 60, borderWidth: 1 },
+  dateDayName: { fontSize: 12, marginBottom: 4 },
+  dateNumber: { fontSize: 16, fontWeight: '600' },
+  dateButtonToday: {},
+  dateTextToday: {},
+  currentDateInfo: { flexDirection: 'row', alignItems: 'center', padding: 16, borderRadius: 8, marginBottom: 20, shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.05, shadowRadius: 2, elevation: 2, borderWidth: 1 },
+  currentDateText: { fontSize: 16, fontWeight: '600', marginLeft: 8, flex: 1 },
+  existingBadge: { paddingHorizontal: 8, paddingVertical: 4, borderRadius: 4 },
+  existingBadgeText: { fontSize: 12, fontWeight: '600' },
+  formSection: { marginBottom: 24 },
+  formSectionTitle: { fontSize: 18, fontWeight: '600', marginBottom: 16 },
+  sectionHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 },
+  inputGroup: { marginBottom: 16 },
+  inputLabel: { fontSize: 14, fontWeight: '500', marginBottom: 6 },
+  input: { borderWidth: 1, borderRadius: 8, padding: 12, fontSize: 16 },
+  inputError: { borderColor: '#dc2626' },
+  errorText: { fontSize: 12, marginTop: 4 },
+  addButton: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 8, borderRadius: 6 },
+  addButtonText: { fontWeight: '600', marginLeft: 6 },
+  bookSaleCard: { padding: 16, borderRadius: 12, marginBottom: 12, borderWidth: 1 },
+  bookSaleHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
+  bookSaleTitle: { fontSize: 16, fontWeight: '600', marginBottom: 0 },
+  bookSaleRow: { flexDirection: 'row', marginHorizontal: -6 },
+  bookSaleField: { flex: 1, marginHorizontal: 6 },
+  bookSaleTotal: { fontSize: 16, fontWeight: '600', textAlign: 'right', marginTop: 8 },
+  salesSummary: { padding: 16, borderRadius: 8, marginTop: 12 },
+  salesSummaryText: { fontWeight: '600', textAlign: 'center' },
+  autoSaveInfo: { flexDirection: 'row', alignItems: 'center', padding: 12, borderRadius: 8, marginBottom: 16 },
+  autoSaveText: { fontSize: 14, marginLeft: 8, flex: 1 },
+  submitButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', padding: 16, borderRadius: 12, marginTop: 24, marginBottom: 32 },
+  submitButtonText: { fontSize: 16, fontWeight: '600', marginLeft: 8 },
 });

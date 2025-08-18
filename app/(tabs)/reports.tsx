@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+// app/(tabs)/reports.tsx
+import React, { useEffect, useState } from 'react';
 import {
   View,
   Text,
@@ -9,22 +10,23 @@ import {
   Alert,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { 
-  Calendar, 
-  FileText, 
-  Lock, 
-  Clock as Unlock, 
-  Eye, 
-  Download, 
+import {
+  FileText,
+  Lock,
+  Clock as Unlock,
+  Eye,
   FileDown,
-  ChevronRight,
-  TrendingUp
+  TrendingUp,
 } from 'lucide-react-native';
 import { DataService } from '@/services/DataService';
 import { PDFService } from '@/services/PDFService';
+import { LanguageService } from '@/services/LanguageService';
 import { WeeklyReport, MonthlyReport, DailyReport } from '@/types/Report';
+import { useTheme } from '../providers/ThemeProvider';
 
 export default function ReportsScreen() {
+  const { theme } = useTheme();
+
   const [weeklyReports, setWeeklyReports] = useState<WeeklyReport[]>([]);
   const [monthlyReports, setMonthlyReports] = useState<MonthlyReport[]>([]);
   const [dailyReports, setDailyReports] = useState<DailyReport[]>([]);
@@ -32,8 +34,29 @@ export default function ReportsScreen() {
   const [selectedReport, setSelectedReport] = useState<WeeklyReport | null>(null);
   const [viewMode, setViewMode] = useState<'weekly' | 'monthly' | 'daily'>('weekly');
 
+  // rerender on language change
+  const [, setLangTick] = useState(0);
+
   useEffect(() => {
-    loadReports();
+    let unsubscribeFn: (() => void) | null = null;
+
+    (async () => {
+      try {
+        await DataService.initialize();
+        await LanguageService.initialize();
+        await loadReports();
+        // subscribe and capture unsubscribe function
+        unsubscribeFn = LanguageService.subscribe(() => setLangTick((t) => t + 1));
+      } catch (err) {
+        console.error('init error', err);
+      }
+    })();
+
+    // cleanup returned to React
+    return () => {
+      if (typeof unsubscribeFn === 'function') unsubscribeFn();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const loadReports = async () => {
@@ -41,12 +64,13 @@ export default function ReportsScreen() {
       const weekly = await DataService.getAllWeeklyReports();
       const monthly = await DataService.getAllMonthlyReports();
       const daily = await DataService.getAllDailyReports();
-      
-      setWeeklyReports(weekly.sort((a, b) => b.weekNumber - a.weekNumber));
-      setMonthlyReports(monthly.sort((a, b) => b.year - a.year || b.month - a.month));
-      setDailyReports(daily.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()));
+
+      setWeeklyReports((weekly || []).sort((a, b) => b.weekNumber - a.weekNumber));
+      setMonthlyReports((monthly || []).sort((a, b) => (b.year - a.year) || (b.month - a.month)));
+      setDailyReports((daily || []).sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()));
     } catch (error) {
       console.error('Error loading reports:', error);
+      Alert.alert(LanguageService.t('error'), LanguageService.t('networkError'));
     } finally {
       setLoading(false);
     }
@@ -56,7 +80,8 @@ export default function ReportsScreen() {
     try {
       await PDFService.generateWeeklyPDF(report);
     } catch (error) {
-      Alert.alert('Hitilafu', 'Imeshindwa kutengeneza PDF');
+      console.error(error);
+      Alert.alert(LanguageService.t('error'), LanguageService.t('networkError'));
     }
   };
 
@@ -64,39 +89,41 @@ export default function ReportsScreen() {
     try {
       await PDFService.generateMonthlyPDF(report);
     } catch (error) {
-      Alert.alert('Hitilafu', 'Imeshindwa kutengeneza PDF');
+      console.error(error);
+      Alert.alert(LanguageService.t('error'), LanguageService.t('networkError'));
     }
   };
 
   const generateCurrentMonthReport = async () => {
     try {
       const now = new Date();
-      const monthlyReport = await DataService.generateMonthlyReport(now.getMonth() + 1, now.getFullYear());
+      await DataService.generateMonthlyReport(now.getMonth() + 1, now.getFullYear());
       await loadReports();
-      Alert.alert('Imekamilika!', 'Taarifa ya mwezi imetengenezwa kikamilifu!');
+      Alert.alert(LanguageService.t('success'), LanguageService.t('dataExported'));
     } catch (error) {
-      Alert.alert('Hitilafu', 'Imeshindwa kutengeneza taarifa ya mwezi');
+      console.error(error);
+      Alert.alert(LanguageService.t('error'), LanguageService.t('networkError'));
     }
   };
 
-  const ViewModeSelector = () => (
-    <View style={styles.viewModeSelector}>
+  const ViewModeSelector: React.FC = () => (
+    <View style={[styles.viewModeSelector, { backgroundColor: theme.card, borderColor: theme.border }]}>
       {[
-        { key: 'daily', label: 'Kila Siku' },
-        { key: 'weekly', label: 'Kila Wiki' },
-        { key: 'monthly', label: 'Kila Mwezi' },
+        { key: 'daily', label: LanguageService.t('dailyReport') },
+        { key: 'weekly', label: LanguageService.t('weeklyReport') },
+        { key: 'monthly', label: LanguageService.t('monthlyReport') },
       ].map((mode) => (
         <TouchableOpacity
           key={mode.key}
           style={[
             styles.viewModeButton,
-            viewMode === mode.key && styles.viewModeButtonActive
+            viewMode === (mode.key as 'daily' | 'weekly' | 'monthly') && { backgroundColor: theme.primary },
           ]}
           onPress={() => setViewMode(mode.key as any)}
         >
           <Text style={[
             styles.viewModeText,
-            viewMode === mode.key && styles.viewModeTextActive
+            viewMode === mode.key ? { color: theme.surface } : { color: theme.textSecondary }
           ]}>
             {mode.label}
           </Text>
@@ -106,181 +133,185 @@ export default function ReportsScreen() {
   );
 
   const DailyReportCard = ({ item }: { item: DailyReport }) => (
-    <View style={styles.reportCard}>
+    <View style={[styles.reportCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
       <View style={styles.reportHeader}>
-        <Text style={styles.reportTitle}>
-          {DataService.getDayName(new Date(item.date))}
+        <Text style={[styles.reportTitle, { color: theme.text }]}>
+          {LanguageService.getDayName(new Date(item.date))}
         </Text>
-        <Text style={styles.reportDate}>
+        <Text style={[styles.reportDate, { color: theme.textSecondary }]}>
           {new Date(item.date).toLocaleDateString()}
         </Text>
       </View>
 
       <View style={styles.reportStats}>
         <View style={styles.reportStat}>
-          <Text style={styles.reportStatValue}>{item.hoursWorked}h</Text>
-          <Text style={styles.reportStatLabel}>Masaa</Text>
+          <Text style={[styles.reportStatValue, { color: theme.text }]}>{item.hoursWorked}h</Text>
+          <Text style={[styles.reportStatLabel, { color: theme.textSecondary }]}>{LanguageService.t('hoursWorked')}</Text>
         </View>
         <View style={styles.reportStat}>
-          <Text style={styles.reportStatValue}>{item.booksSold}</Text>
-          <Text style={styles.reportStatLabel}>Vitabu</Text>
+          <Text style={[styles.reportStatValue, { color: theme.text }]}>{item.booksSold}</Text>
+          <Text style={[styles.reportStatLabel, { color: theme.textSecondary }]}>{LanguageService.t('booksSold')}</Text>
         </View>
         <View style={styles.reportStat}>
-          <Text style={styles.reportStatValue}>TSH {item.dailyAmount.toLocaleString()}</Text>
-          <Text style={styles.reportStatLabel}>Mauzo</Text>
+          <Text style={[styles.reportStatValue, { color: theme.text } ]}>TSH {Number(item.dailyAmount || 0).toLocaleString()}</Text>
+          <Text style={[styles.reportStatLabel, { color: theme.textSecondary }]}>{LanguageService.t('totalSales')}</Text>
         </View>
       </View>
     </View>
   );
 
   const WeeklyReportCard = ({ item }: { item: WeeklyReport }) => (
-    <TouchableOpacity 
-      style={styles.reportCard}
+    <TouchableOpacity
+      style={[styles.reportCard, { backgroundColor: theme.card, borderColor: theme.border }]}
       onPress={() => setSelectedReport(item)}
     >
       <View style={styles.reportHeader}>
-        <View style={styles.reportNumberBadge}>
-          <Text style={styles.reportNumber}>Wiki #{item.weekNumber}</Text>
+        <View style={[styles.reportNumberBadge, { backgroundColor: theme.primary }]}>
+          <Text style={[styles.reportNumber, { color: theme.surface }]}>{LanguageService.t('weeklyReport')} #{item.weekNumber}</Text>
         </View>
         <View style={styles.lockStatus}>
           {item.isLocked ? (
-            <Lock size={16} color="#dc2626" />
+            <Lock size={16} color={theme.error} />
           ) : (
-            <Unlock size={16} color="#059669" />
+            <Unlock size={16} color={theme.success} />
           )}
         </View>
       </View>
 
-      <Text style={styles.reportStudentName}>{item.studentName}</Text>
-      <Text style={styles.reportDate}>
+      <Text style={[styles.reportStudentName, { color: theme.text }]}>{item.studentName}</Text>
+      <Text style={[styles.reportDate, { color: theme.textSecondary }]}>
         {new Date(item.weekStartDate).toLocaleDateString()} - {new Date(item.weekEndDate).toLocaleDateString()}
       </Text>
 
       <View style={styles.reportStats}>
         <View style={styles.reportStat}>
-          <Text style={styles.reportStatValue}>{item.totalHours}h</Text>
-          <Text style={styles.reportStatLabel}>Masaa</Text>
+          <Text style={[styles.reportStatValue, { color: theme.text }]}>{item.totalHours}h</Text>
+          <Text style={[styles.reportStatLabel, { color: theme.textSecondary }]}>{LanguageService.t('hoursWorked')}</Text>
         </View>
         <View style={styles.reportStat}>
-          <Text style={styles.reportStatValue}>{item.totalBooksSold}</Text>
-          <Text style={styles.reportStatLabel}>Vitabu</Text>
+          <Text style={[styles.reportStatValue, { color: theme.text }]}>{item.totalBooksSold}</Text>
+          <Text style={[styles.reportStatLabel, { color: theme.textSecondary }]}>{LanguageService.t('booksSold')}</Text>
         </View>
         <View style={styles.reportStat}>
-          <Text style={styles.reportStatValue}>TSH {item.totalAmount.toLocaleString()}</Text>
-          <Text style={styles.reportStatLabel}>Mauzo</Text>
+          <Text style={[styles.reportStatValue, { color: theme.text } ]}>TSH {Number(item.totalAmount || 0).toLocaleString()}</Text>
+          <Text style={[styles.reportStatLabel, { color: theme.textSecondary }]}>{LanguageService.t('totalSales')}</Text>
         </View>
       </View>
 
       <View style={styles.reportActions}>
-        <TouchableOpacity style={styles.actionButton}>
-          <Eye size={16} color="#1e3a8a" />
-          <Text style={styles.actionButtonText}>Ona Maelezo</Text>
+        <TouchableOpacity
+          style={[styles.actionButton, { backgroundColor: theme.surface + '10' }]}
+          onPress={() => setSelectedReport(item)} // view details
+        >
+          <Eye size={16} color={theme.primary} />
+          <Text style={[styles.actionButtonText, { color: theme.primary }]}>{LanguageService.t('viewDetails')}</Text>
         </TouchableOpacity>
-        <TouchableOpacity 
-          style={styles.pdfButton}
+
+        <TouchableOpacity
+          style={[styles.pdfButton, { backgroundColor: theme.success + '10' }]}
           onPress={() => generateWeeklyPDF(item)}
         >
-          <FileDown size={16} color="#059669" />
-          <Text style={styles.pdfButtonText}>PDF</Text>
+          <FileDown size={16} color={theme.success} />
+          <Text style={[styles.pdfButtonText, { color: theme.success }]}>{LanguageService.t('generatePDF')}</Text>
         </TouchableOpacity>
       </View>
     </TouchableOpacity>
   );
 
   const MonthlyReportCard = ({ item }: { item: MonthlyReport }) => (
-    <View style={styles.reportCard}>
+    <View style={[styles.reportCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
       <View style={styles.reportHeader}>
-        <Text style={styles.reportTitle}>
-          {DataService.getMonthName(item.month)} {item.year}
+        <Text style={[styles.reportTitle, { color: theme.text }]}>
+          {LanguageService.getMonthName(item.month)} {item.year}
         </Text>
-        <TouchableOpacity 
-          style={styles.pdfButton}
+        <TouchableOpacity
+          style={[styles.pdfButton, { backgroundColor: theme.success + '10' }]}
           onPress={() => generateMonthlyPDF(item)}
         >
-          <FileDown size={16} color="#059669" />
-          <Text style={styles.pdfButtonText}>PDF</Text>
+          <FileDown size={16} color={theme.success} />
+          <Text style={[styles.pdfButtonText, { color: theme.success }]}>{LanguageService.t('generatePDF')}</Text>
         </TouchableOpacity>
       </View>
 
-      <Text style={styles.reportStudentName}>{item.studentName}</Text>
-      <Text style={styles.reportDate}>{item.weeklyReports.length} wiki</Text>
+      <Text style={[styles.reportStudentName, { color: theme.text }]}>{item.studentName}</Text>
+      <Text style={[styles.reportDate, { color: theme.textSecondary }]}>{(item.weeklyReports || []).length} {LanguageService.t('weeklyReport')}</Text>
 
       <View style={styles.reportStats}>
         <View style={styles.reportStat}>
-          <Text style={styles.reportStatValue}>{item.totalHours}h</Text>
-          <Text style={styles.reportStatLabel}>Masaa</Text>
+          <Text style={[styles.reportStatValue, { color: theme.text }]}>{item.totalHours}h</Text>
+          <Text style={[styles.reportStatLabel, { color: theme.textSecondary }]}>{LanguageService.t('hoursWorked')}</Text>
         </View>
         <View style={styles.reportStat}>
-          <Text style={styles.reportStatValue}>{item.totalBooks}</Text>
-          <Text style={styles.reportStatLabel}>Vitabu</Text>
+          <Text style={[styles.reportStatValue, { color: theme.text }]}>{item.totalBooks}</Text>
+          <Text style={[styles.reportStatLabel, { color: theme.textSecondary }]}>{LanguageService.t('booksSold')}</Text>
         </View>
         <View style={styles.reportStat}>
-          <Text style={styles.reportStatValue}>TSH {item.totalAmount.toLocaleString()}</Text>
-          <Text style={styles.reportStatLabel}>Mauzo</Text>
+          <Text style={[styles.reportStatValue, { color: theme.text } ]}>TSH {Number(item.totalAmount || 0).toLocaleString()}</Text>
+          <Text style={[styles.reportStatLabel, { color: theme.textSecondary }]}>{LanguageService.t('totalSales')}</Text>
         </View>
       </View>
     </View>
   );
 
   const ReportDetail = ({ report }: { report: WeeklyReport }) => (
-    <View style={styles.detailContainer}>
-      <View style={styles.detailHeader}>
-        <Text style={styles.detailTitle}>Wiki #{report.weekNumber}</Text>
+    <View style={[styles.detailContainer, { backgroundColor: theme.card }]}>
+      <View style={[styles.detailHeader, { backgroundColor: theme.primary }]}>
+        <Text style={[styles.detailTitle, { color: theme.surface }]}>{LanguageService.t('weeklyReport')} #{report.weekNumber}</Text>
         <TouchableOpacity onPress={() => setSelectedReport(null)}>
-          <Text style={styles.closeButton}>Funga</Text>
+          <Text style={[styles.closeButton, { color: theme.surface + 'cc' }]}>{LanguageService.t('close')}</Text>
         </TouchableOpacity>
       </View>
 
-      <ScrollView style={styles.detailContent}>
+      <ScrollView style={[styles.detailContent, { backgroundColor: theme.background }]}>
         <View style={styles.detailSection}>
-          <Text style={styles.detailSectionTitle}>Taarifa za Msingi</Text>
-          <Text style={styles.detailItem}>Mwanafunzi: {report.studentName}</Text>
-          <Text style={styles.detailItem}>Simu: {report.phoneNumber}</Text>
-          <Text style={styles.detailItem}>
-            Wiki: {new Date(report.weekStartDate).toLocaleDateString()} - {new Date(report.weekEndDate).toLocaleDateString()}
+          <Text style={[styles.detailSectionTitle, { color: theme.text }]}>{LanguageService.t('dailyReport')}</Text>
+          <Text style={[styles.detailItem, { color: theme.text }]}>{LanguageService.t('newReport')}: {report.studentName}</Text>
+          <Text style={[styles.detailItem, { color: theme.text }]}>{LanguageService.t('phoneNumber')}: {report.phoneNumber}</Text>
+          <Text style={[styles.detailItem, { color: theme.text }]}>
+            {LanguageService.t('weekStatus')}: {new Date(report.weekStartDate).toLocaleDateString()} - {new Date(report.weekEndDate).toLocaleDateString()}
           </Text>
         </View>
 
         <View style={styles.detailSection}>
-          <Text style={styles.detailSectionTitle}>Jumla ya Wiki</Text>
-          <Text style={styles.detailItem}>Masaa ya Kazi: {report.totalHours}</Text>
-          <Text style={styles.detailItem}>Vitabu Vilivyouzwa: {report.totalBooksSold}</Text>
-          <Text style={styles.detailItem}>Kiasi cha Wiki: TSH {report.totalAmount.toLocaleString()}</Text>
-          <Text style={styles.detailItem}>Vitabu vya Bure: {report.totalFreeLiterature}</Text>
+          <Text style={[styles.detailSectionTitle, { color: theme.text }]}>{LanguageService.t('weeklyReport')}</Text>
+          <Text style={[styles.detailItem, { color: theme.text }]}>{LanguageService.t('hoursWorked')}: {report.totalHours}</Text>
+          <Text style={[styles.detailItem, { color: theme.text }]}>{LanguageService.t('booksSold')}: {report.totalBooksSold}</Text>
+          <Text style={[styles.detailItem, { color: theme.text }]}>{LanguageService.t('totalSales')}: TSH {Number(report.totalAmount || 0).toLocaleString()}</Text>
+          <Text style={[styles.detailItem, { color: theme.text }]}>{LanguageService.t('freeLiterature')}: {report.totalFreeLiterature}</Text>
         </View>
 
         <View style={styles.detailSection}>
-          <Text style={styles.detailSectionTitle}>Shughuli za Uongozaji</Text>
-          <Text style={styles.detailItem}>Shughuli za VOP: {report.totalVopActivities}</Text>
-          <Text style={styles.detailItem}>Waliofika Kanisani: {report.totalChurchAttendees}</Text>
-          <Text style={styles.detailItem}>Waliorudi Nyuma: {report.totalBackSlidesVisited}</Text>
-          <Text style={styles.detailItem}>Maombi Yaliyotolewa: {report.totalPrayersOffered}</Text>
-          <Text style={styles.detailItem}>Masomo ya Biblia: {report.totalBibleStudies}</Text>
-          <Text style={styles.detailItem}>Wagombea Ubatizo: {report.totalBaptismCandidates}</Text>
-          <Text style={styles.detailItem}>Mabatizo Yaliyofanywa: {report.totalBaptismsPerformed}</Text>
-          <Text style={styles.detailItem}>Watu Waliotembelewa: {report.totalPeopleVisited}</Text>
+          <Text style={[styles.detailSectionTitle, { color: theme.text }]}>{LanguageService.t('ministryActivities')}</Text>
+          <Text style={[styles.detailItem, { color: theme.text }]}>{LanguageService.t('vopActivities')}: {report.totalVopActivities}</Text>
+          <Text style={[styles.detailItem, { color: theme.text }]}>{LanguageService.t('churchAttendees')}: {report.totalChurchAttendees}</Text>
+          <Text style={[styles.detailItem, { color: theme.text }]}>{LanguageService.t('backSlidesVisited')}: {report.totalBackSlidesVisited}</Text>
+          <Text style={[styles.detailItem, { color: theme.text }]}>{LanguageService.t('prayersOffered')}: {report.totalPrayersOffered}</Text>
+          <Text style={[styles.detailItem, { color: theme.text }]}>{LanguageService.t('bibleStudies')}: {report.totalBibleStudies}</Text>
+          <Text style={[styles.detailItem, { color: theme.text }]}>{LanguageService.t('baptismCandidates')}: {report.totalBaptismCandidates}</Text>
+          <Text style={[styles.detailItem, { color: theme.text }]}>{LanguageService.t('baptismsPerformed')}: {report.totalBaptismsPerformed}</Text>
+          <Text style={[styles.detailItem, { color: theme.text }]}>{LanguageService.t('peopleVisited')}: {report.totalPeopleVisited}</Text>
         </View>
 
         <View style={styles.detailSection}>
-          <Text style={styles.detailSectionTitle}>Taarifa za Kila Siku</Text>
-          {report.dailyReports.map((daily, index) => (
-            <View key={index} style={styles.dailyReportDetail}>
-              <Text style={styles.dailyReportTitle}>
-                {DataService.getDayName(new Date(daily.date))} - {new Date(daily.date).toLocaleDateString()}
+          <Text style={[styles.detailSectionTitle, { color: theme.text }]}>{LanguageService.t('dailyReport')}</Text>
+          {(report.dailyReports || []).map((daily, index) => (
+            <View key={index} style={[styles.dailyReportDetail, { backgroundColor: theme.card }]}>
+              <Text style={[styles.dailyReportTitle, { color: theme.text }]}>
+                {LanguageService.getDayName(new Date(daily.date))} - {new Date(daily.date).toLocaleDateString()}
               </Text>
-              <Text style={styles.dailyReportInfo}>
-                Masaa: {daily.hoursWorked} | Vitabu: {daily.booksSold} | Mauzo: TSH {daily.dailyAmount.toLocaleString()}
+              <Text style={[styles.dailyReportInfo, { color: theme.textSecondary }]}>
+                {LanguageService.t('hoursWorked')}: {daily.hoursWorked} | {LanguageService.t('booksSold')}: {daily.booksSold} | {LanguageService.t('totalSales')}: TSH {Number(daily.dailyAmount || 0).toLocaleString()}
               </Text>
             </View>
           ))}
         </View>
 
-        <TouchableOpacity 
-          style={styles.pdfGenerateButton}
+        <TouchableOpacity
+          style={[styles.pdfGenerateButton, { backgroundColor: theme.success }]}
           onPress={() => generateWeeklyPDF(report)}
         >
-          <FileDown size={20} color="#ffffff" />
-          <Text style={styles.pdfGenerateButtonText}>Tengeneza PDF ya Wiki</Text>
+          <FileDown size={20} color={theme.surface} />
+          <Text style={[styles.pdfGenerateButtonText, { color: theme.surface }]}>{LanguageService.t('generatePDF')}</Text>
         </TouchableOpacity>
       </ScrollView>
     </View>
@@ -288,22 +319,22 @@ export default function ReportsScreen() {
 
   if (selectedReport) {
     return (
-      <SafeAreaView style={styles.container}>
+      <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
         <ReportDetail report={selectedReport} />
       </SafeAreaView>
     );
   }
 
   return (
-    <SafeAreaView style={styles.container}>
+    <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
       {/* Header */}
-      <View style={styles.header}>
-        <Text style={styles.headerTitle}>Historia ya Taarifa</Text>
-        <Text style={styles.headerSubtitle}>Ona na simamia taarifa zako</Text>
-        
-        <TouchableOpacity style={styles.monthlyButton} onPress={generateCurrentMonthReport}>
-          <TrendingUp size={16} color="#ffffff" />
-          <Text style={styles.monthlyButtonText}>Tengeneza Taarifa ya Mwezi</Text>
+      <View style={[styles.header, { backgroundColor: theme.primary }]}>
+        <Text style={[styles.headerTitle, { color: theme.surface }]}>{LanguageService.t('reportHistory')}</Text>
+        <Text style={[styles.headerSubtitle, { color: theme.surface + 'cc' }]}>{LanguageService.t('reportHistory')}</Text>
+
+        <TouchableOpacity style={[styles.monthlyButton, { backgroundColor: theme.success }]} onPress={generateCurrentMonthReport}>
+          <TrendingUp size={16} color={theme.surface} />
+          <Text style={[styles.monthlyButtonText, { color: theme.surface }]}>{LanguageService.t('generateMonthlyReport')}</Text>
         </TouchableOpacity>
       </View>
 
@@ -311,23 +342,23 @@ export default function ReportsScreen() {
       <ViewModeSelector />
 
       {/* Reports List */}
-      <View style={styles.listContainer}>
+      <View style={[styles.listContainer]}>
         {loading ? (
-          <Text style={styles.loadingText}>Inapakia taarifa...</Text>
+          <Text style={[styles.loadingText, { color: theme.textSecondary }]}>{LanguageService.t('loading')}</Text>
         ) : (
           <>
             {viewMode === 'daily' && (
               <>
                 {dailyReports.length === 0 ? (
                   <View style={styles.emptyState}>
-                    <FileText size={64} color="#9ca3af" />
-                    <Text style={styles.emptyStateTitle}>Hakuna Taarifa za Kila Siku</Text>
-                    <Text style={styles.emptyStateText}>Tengeneza taarifa ya kwanza ya kila siku</Text>
+                    <FileText size={64} color={theme.textSecondary} />
+                    <Text style={[styles.emptyStateTitle, { color: theme.text }]}>{LanguageService.t('noReportToday')}</Text>
+                    <Text style={[styles.emptyStateText, { color: theme.textSecondary }]}>{LanguageService.t('submitFirstReport')}</Text>
                   </View>
                 ) : (
                   <FlatList
                     data={dailyReports}
-                    renderItem={DailyReportCard}
+                    renderItem={({ item }) => <DailyReportCard item={item} />}
                     keyExtractor={(item) => item.id}
                     showsVerticalScrollIndicator={false}
                     contentContainerStyle={styles.listContent}
@@ -340,14 +371,14 @@ export default function ReportsScreen() {
               <>
                 {weeklyReports.length === 0 ? (
                   <View style={styles.emptyState}>
-                    <FileText size={64} color="#9ca3af" />
-                    <Text style={styles.emptyStateTitle}>Hakuna Taarifa za Wiki</Text>
-                    <Text style={styles.emptyStateText}>Taarifa za wiki zitatengenezwa moja kwa moja</Text>
+                    <FileText size={64} color={theme.textSecondary} />
+                    <Text style={[styles.emptyStateTitle, { color: theme.text }]}>{LanguageService.t('noAnalytics')}</Text>
+                    <Text style={[styles.emptyStateText, { color: theme.textSecondary }]}>{LanguageService.t('submitFirstReport')}</Text>
                   </View>
                 ) : (
                   <FlatList
                     data={weeklyReports}
-                    renderItem={WeeklyReportCard}
+                    renderItem={({ item }) => <WeeklyReportCard item={item} />}
                     keyExtractor={(item) => item.id}
                     showsVerticalScrollIndicator={false}
                     contentContainerStyle={styles.listContent}
@@ -360,14 +391,14 @@ export default function ReportsScreen() {
               <>
                 {monthlyReports.length === 0 ? (
                   <View style={styles.emptyState}>
-                    <FileText size={64} color="#9ca3af" />
-                    <Text style={styles.emptyStateTitle}>Hakuna Taarifa za Mwezi</Text>
-                    <Text style={styles.emptyStateText}>Bonyeza "Tengeneza Taarifa ya Mwezi" hapo juu</Text>
+                    <FileText size={64} color={theme.textSecondary} />
+                    <Text style={[styles.emptyStateTitle, { color: theme.text }]}>{LanguageService.t('noAnalytics')}</Text>
+                    <Text style={[styles.emptyStateText, { color: theme.textSecondary }]}>{LanguageService.t('generateMonthlyReport')}</Text>
                   </View>
                 ) : (
                   <FlatList
                     data={monthlyReports}
-                    renderItem={MonthlyReportCard}
+                    renderItem={({ item }) => <MonthlyReportCard item={item} />}
                     keyExtractor={(item) => item.id}
                     showsVerticalScrollIndicator={false}
                     contentContainerStyle={styles.listContent}
@@ -382,46 +413,41 @@ export default function ReportsScreen() {
   );
 }
 
+// --- styles (unchanged from your file) ---
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#f8fafc',
   },
   header: {
     padding: 24,
-    backgroundColor: '#1e3a8a',
   },
   headerTitle: {
     fontSize: 24,
     fontWeight: 'bold',
-    color: '#ffffff',
     marginBottom: 4,
   },
   headerSubtitle: {
     fontSize: 14,
-    color: '#bfdbfe',
     marginBottom: 16,
   },
   monthlyButton: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#059669',
     paddingHorizontal: 16,
     paddingVertical: 8,
     borderRadius: 6,
     alignSelf: 'flex-start',
   },
   monthlyButtonText: {
-    color: '#ffffff',
     fontWeight: '600',
     marginLeft: 6,
   },
   viewModeSelector: {
     flexDirection: 'row',
     margin: 16,
-    backgroundColor: '#ffffff',
     borderRadius: 8,
     padding: 4,
+    borderWidth: 1,
   },
   viewModeButton: {
     flex: 1,
@@ -430,16 +456,9 @@ const styles = StyleSheet.create({
     borderRadius: 6,
     alignItems: 'center',
   },
-  viewModeButtonActive: {
-    backgroundColor: '#1e3a8a',
-  },
   viewModeText: {
     fontSize: 14,
     fontWeight: '500',
-    color: '#6b7280',
-  },
-  viewModeTextActive: {
-    color: '#ffffff',
   },
   listContainer: {
     flex: 1,
@@ -451,7 +470,6 @@ const styles = StyleSheet.create({
   loadingText: {
     textAlign: 'center',
     fontSize: 16,
-    color: '#6b7280',
     marginTop: 32,
   },
   emptyState: {
@@ -463,17 +481,14 @@ const styles = StyleSheet.create({
   emptyStateTitle: {
     fontSize: 20,
     fontWeight: '600',
-    color: '#1f2937',
     marginTop: 16,
     marginBottom: 8,
   },
   emptyStateText: {
     fontSize: 14,
-    color: '#6b7280',
     textAlign: 'center',
   },
   reportCard: {
-    backgroundColor: '#ffffff',
     padding: 16,
     borderRadius: 12,
     marginBottom: 12,
@@ -482,6 +497,7 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.1,
     shadowRadius: 4,
     elevation: 3,
+    borderWidth: 1,
   },
   reportHeader: {
     flexDirection: 'row',
@@ -492,16 +508,14 @@ const styles = StyleSheet.create({
   reportTitle: {
     fontSize: 18,
     fontWeight: '600',
-    color: '#1f2937',
+    marginRight: 8,
   },
   reportNumberBadge: {
-    backgroundColor: '#1e3a8a',
     paddingHorizontal: 12,
     paddingVertical: 4,
     borderRadius: 16,
   },
   reportNumber: {
-    color: '#ffffff',
     fontWeight: '600',
     fontSize: 12,
   },
@@ -511,12 +525,10 @@ const styles = StyleSheet.create({
   reportStudentName: {
     fontSize: 16,
     fontWeight: '500',
-    color: '#1f2937',
     marginBottom: 4,
   },
   reportDate: {
     fontSize: 14,
-    color: '#6b7280',
     marginBottom: 12,
   },
   reportStats: {
@@ -530,11 +542,9 @@ const styles = StyleSheet.create({
   reportStatValue: {
     fontSize: 16,
     fontWeight: '600',
-    color: '#1f2937',
   },
   reportStatLabel: {
     fontSize: 12,
-    color: '#6b7280',
   },
   reportActions: {
     flexDirection: 'row',
@@ -543,62 +553,52 @@ const styles = StyleSheet.create({
   actionButton: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#eff6ff',
     paddingHorizontal: 12,
     paddingVertical: 6,
     borderRadius: 6,
   },
   actionButtonText: {
-    color: '#1e3a8a',
     fontWeight: '500',
     marginLeft: 4,
   },
   pdfButton: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#f0fdf4',
     paddingHorizontal: 12,
     paddingVertical: 6,
     borderRadius: 6,
   },
   pdfButtonText: {
-    color: '#059669',
     fontWeight: '500',
     marginLeft: 4,
   },
   pdfGenerateButton: {
-    backgroundColor: '#059669',
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
     padding: 16,
     borderRadius: 8,
     marginTop: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexDirection: 'row',
   },
   pdfGenerateButtonText: {
-    color: '#ffffff',
     fontWeight: '600',
     marginLeft: 8,
   },
   detailContainer: {
     flex: 1,
-    backgroundColor: '#ffffff',
   },
   detailHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
     padding: 24,
-    backgroundColor: '#1e3a8a',
   },
   detailTitle: {
     fontSize: 20,
     fontWeight: 'bold',
-    color: '#ffffff',
   },
   closeButton: {
     fontSize: 16,
-    color: '#bfdbfe',
     fontWeight: '500',
   },
   detailContent: {
@@ -611,17 +611,14 @@ const styles = StyleSheet.create({
   detailSectionTitle: {
     fontSize: 18,
     fontWeight: '600',
-    color: '#1f2937',
     marginBottom: 12,
   },
   detailItem: {
     fontSize: 16,
-    color: '#374151',
     marginBottom: 8,
     paddingVertical: 4,
   },
   dailyReportDetail: {
-    backgroundColor: '#f9fafb',
     padding: 12,
     borderRadius: 8,
     marginBottom: 8,
@@ -629,11 +626,9 @@ const styles = StyleSheet.create({
   dailyReportTitle: {
     fontSize: 16,
     fontWeight: '600',
-    color: '#1f2937',
     marginBottom: 4,
   },
   dailyReportInfo: {
     fontSize: 14,
-    color: '#6b7280',
   },
 });

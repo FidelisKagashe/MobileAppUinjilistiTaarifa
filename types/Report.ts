@@ -80,4 +80,7 @@ export interface AppSettings {
   reminderNotifications: boolean;
   lastBackup: string | null;
   authMethod: 'password' | 'biometric' | 'pattern';
+  theme: 'light' | 'dark';
+  language: 'sw' | 'en';
+  firstUseDate: string | null;
 }
