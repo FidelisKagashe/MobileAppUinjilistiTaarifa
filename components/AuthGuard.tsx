@@ -14,7 +14,7 @@ import * as LocalAuthentication from 'expo-local-authentication';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { DataService } from '@/services/DataService';
 import { LanguageService } from '@/services/LanguageService';
-import { UserProfile } from '@/types/Report';
+import { UserProfile, WorkWeekInfo } from '@/types/Report';
 import { useTheme } from '@/app/providers/ThemeProvider';
 
 interface AuthGuardProps {
@@ -47,6 +47,15 @@ export default function AuthGuard({ children }: AuthGuardProps) {
   const [lockUntil, setLockUntil] = useState<number | null>(null); // timestamp in ms
   const [lockRemainingSec, setLockRemainingSec] = useState<number>(0);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  
+  // New states for authentication methods and first-time login
+  const [showFirstTimeWelcome, setShowFirstTimeWelcome] = useState(false);
+  const [workWeekInfo, setWorkWeekInfo] = useState<WorkWeekInfo | null>(null);
+  const [authMethodSelection, setAuthMethodSelection] = useState<'password' | 'pin' | 'pattern' | 'biometric'>('password');
+  const [pinCode, setPinCode] = useState('');
+  const [confirmPinCode, setConfirmPinCode] = useState('');
+  const [patternPoints, setPatternPoints] = useState<number[]>([]);
+  const [confirmPatternPoints, setConfirmPatternPoints] = useState<number[]>([]);
 
   const lockTimerRef = useRef<number | null>(null);
 
@@ -216,17 +225,50 @@ export default function AuthGuard({ children }: AuthGuardProps) {
 
   const handleSetupComplete = async () => {
     if (isFirstTime) {
-      if (password !== confirmPassword) {
+      if (authMethodSelection === 'password' && password !== confirmPassword) {
         Alert.alert(
           currentLanguage === 'sw' ? 'Hitilafu' : 'Error',
           currentLanguage === 'sw' ? 'Password hazifanani' : 'Passwords do not match'
         );
         return;
       }
-      if (password.length < 4) {
+      
+      if (authMethodSelection === 'password' && password.length < 4) {
         Alert.alert(
           currentLanguage === 'sw' ? 'Hitilafu' : 'Error',
           currentLanguage === 'sw' ? 'Password lazima iwe angalau herufi 4' : 'Password must be at least 4 characters'
+        );
+        return;
+      }
+      
+      if (authMethodSelection === 'pin' && pinCode !== confirmPinCode) {
+        Alert.alert(
+          currentLanguage === 'sw' ? 'Hitilafu' : 'Error',
+          currentLanguage === 'sw' ? 'PIN hazifanani' : 'PINs do not match'
+        );
+        return;
+      }
+      
+      if (authMethodSelection === 'pin' && pinCode.length < 4) {
+        Alert.alert(
+          currentLanguage === 'sw' ? 'Hitilafu' : 'Error',
+          currentLanguage === 'sw' ? 'PIN lazima iwe angalau namba 4' : 'PIN must be at least 4 digits'
+        );
+        return;
+      }
+      
+      if (authMethodSelection === 'pattern' && patternPoints.length < 4) {
+        Alert.alert(
+          currentLanguage === 'sw' ? 'Hitilafu' : 'Error',
+          currentLanguage === 'sw' ? 'Mchoro lazima uwe na angalau nukta 4' : 'Pattern must have at least 4 points'
+        );
+        return;
+      }
+      
+      if (authMethodSelection === 'pattern' && JSON.stringify(patternPoints) !== JSON.stringify(confirmPatternPoints)) {
+        Alert.alert(
+          currentLanguage === 'sw' ? 'Hitilafu' : 'Error',
+          currentLanguage === 'sw' ? 'Michoro haifanani' : 'Patterns do not match'
         );
         return;
       }
@@ -252,7 +294,13 @@ export default function AuthGuard({ children }: AuthGuardProps) {
     setLoading(true);
     try {
       if (isFirstTime) {
-        await DataService.setPassword(password);
+        if (authMethodSelection === 'password') {
+          await DataService.setPassword(password);
+        } else if (authMethodSelection === 'pin') {
+          await DataService.setPassword(pinCode);
+        } else if (authMethodSelection === 'pattern') {
+          await DataService.setPassword(JSON.stringify(patternPoints));
+        }
       }
 
       if (needsProfile) {
@@ -267,11 +315,22 @@ export default function AuthGuard({ children }: AuthGuardProps) {
       }
 
       await DataService.updateSettings({
-        authMethod,
+        authMethod: authMethodSelection as 'password' | 'biometric' | 'pattern' | 'pin',
         biometricEnabled: authMethod === 'biometric' && biometricAvailable
       });
 
-      // setup complete - clear attempt state
+      // Record first login and get work week info
+      const isFirstLogin = await DataService.isFirstTimeLogin();
+      if (isFirstLogin) {
+        await DataService.recordFirstLogin();
+        const weekInfo = await DataService.getCurrentWorkWeek();
+        setWorkWeekInfo(weekInfo);
+        setShowFirstTimeWelcome(true);
+        setLoading(false);
+        return;
+      }
+
+      // Setup complete - clear attempt state
       await clearLock();
       setIsAuthenticated(true);
     } catch (error) {
@@ -283,6 +342,11 @@ export default function AuthGuard({ children }: AuthGuardProps) {
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleFirstTimeWelcomeComplete = () => {
+    setShowFirstTimeWelcome(false);
+    setIsAuthenticated(true);
   };
 
   const handlePasswordAuth = async () => {
@@ -307,6 +371,13 @@ export default function AuthGuard({ children }: AuthGuardProps) {
         await persistLockUntil(null);
         setFailedAttempts(0);
         setIsAuthenticated(true);
+        
+        // Check if this is first login after setup
+        const isFirstLogin = await DataService.isFirstTimeLogin();
+        if (isFirstLogin) {
+          await DataService.recordFirstLogin();
+          // Show work week info on first successful login
+        }
       } else {
         // incorrect password -> increment attempts
         const nextAttempts = failedAttempts + 1;
@@ -344,10 +415,73 @@ export default function AuthGuard({ children }: AuthGuardProps) {
     }
   };
 
+  const PatternGrid = ({ onPatternChange, currentPattern }: { onPatternChange: (pattern: number[]) => void, currentPattern: number[] }) => {
+    const handlePointToggle = (point: number) => {
+      const newPattern = currentPattern.includes(point) 
+        ? currentPattern.filter(p => p !== point)
+        : [...currentPattern, point];
+      onPatternChange(newPattern);
+    };
+
+    return (
+      <View style={styles.patternGrid}>
+        {Array.from({ length: 9 }, (_, i) => (
+          <TouchableOpacity
+            key={i}
+            style={[styles.patternPoint, currentPattern.includes(i) && { backgroundColor: theme.primary }]}
+            onPress={() => handlePointToggle(i)}
+          />
+        ))}
+      </View>
+    );
+  };
+
   // --- UI rendering ---
 
   if (isAuthenticated) {
     return <>{children}</>;
+  }
+
+  // First-time welcome screen
+  if (showFirstTimeWelcome && workWeekInfo) {
+    return (
+      <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
+        <View style={styles.authContainer}>
+          <View style={styles.logoContainer}>
+            <View style={[styles.logoCircle, { backgroundColor: theme.success }]}>
+              <User size={32} color="#ffffff" />
+            </View>
+            <Text style={[styles.appTitle, { color: theme.text }]}>
+              {currentLanguage === 'sw' ? 'Karibu!' : 'Welcome!'}
+            </Text>
+            <Text style={[styles.appSubtitle, { color: theme.textSecondary }]}>
+              {currentLanguage === 'sw' ? 'Hii ni mara yako ya kwanza kuingia' : 'This is your first time logging in'}
+            </Text>
+          </View>
+
+          <View style={[styles.formContainer, { backgroundColor: theme.card }]}>
+            <Text style={[styles.formTitle, { color: theme.text }]}>
+              {currentLanguage === 'sw' ? 'Wiki Yako ya Kazi' : 'Your Work Week'}
+            </Text>
+            <Text style={[styles.formSubtitle, { color: theme.textSecondary }]}>
+              {currentLanguage === 'sw' ? 'Jumatatu hadi Ijumaa, kuishia saa 6:00 jioni' : 'Monday to Friday, ending at 6:00 PM'}
+            </Text>
+
+            {workWeekInfo.workDays.map((day, index) => (
+              <View key={index} style={[styles.workDayItem, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+                <Text style={[styles.workDayName, { color: theme.text }]}>{day.dayName}</Text>
+                <Text style={[styles.workDayDate, { color: theme.textSecondary }]}>{new Date(day.date).toLocaleDateString()}</Text>
+                {day.isToday && <Text style={[styles.todayBadge, { color: theme.primary }]}>Today</Text>}
+              </View>
+            ))}
+
+            <TouchableOpacity style={[styles.authButton, { backgroundColor: theme.primary }]} onPress={handleFirstTimeWelcomeComplete}>
+              <Text style={[styles.authButtonText, { color: '#ffffff' }]}>{currentLanguage === 'sw' ? 'Anza Kazi' : 'Start Working'}</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </SafeAreaView>
+    );
   }
 
   // First time setup or profile setup
@@ -407,9 +541,41 @@ export default function AuthGuard({ children }: AuthGuardProps) {
               </>
             )}
 
+            {/* Authentication Method Selection */}
             {/* Password Fields */}
             {isFirstTime && (
               <>
+                <View style={styles.authMethodContainer}>
+                  <Text style={[styles.authMethodTitle, { color: theme.text }]}>
+                    {currentLanguage === 'sw' ? 'Chagua njia ya kuingia:' : 'Choose authentication method:'}
+                  </Text>
+                  <View style={styles.authMethodButtons}>
+                    <TouchableOpacity
+                      style={[
+                        styles.authMethodButton,
+                        { borderColor: theme.primary, backgroundColor: authMethodSelection === 'password' ? theme.primary : theme.surface }
+                      ]}
+                      onPress={() => setAuthMethodSelection('password')}
+                    >
+                      <Lock size={16} color={authMethodSelection === 'password' ? '#ffffff' : theme.primary} />
+                      <Text style={[
+                        styles.authMethodText,
+                        { color: authMethodSelection === 'password' ? '#ffffff' : theme.primary }
+                      ]}>Password</Text>
+                    </TouchableOpacity>
+
+                    <TouchableOpacity
+                      style={[
+                        styles.authMethodButton,
+                        { borderColor: theme.primary, backgroundColor: authMethodSelection === 'pin' ? theme.primary : theme.surface }
+                      ]}
+                      onPress={() => setAuthMethodSelection('pin')}
+                    >
+                      <Text style={[
+                        styles.authMethodText,
+                        { color: authMethodSelection === 'pin' ? '#ffffff' : theme.primary }
+                      ]}>PIN</Text>
+                    </TouchableOpacity>
                 <View style={styles.inputContainer}>
                   <Lock size={20} color={theme.textSecondary} style={styles.inputIcon} />
                   <TextInput
@@ -433,6 +599,23 @@ export default function AuthGuard({ children }: AuthGuardProps) {
                   </TouchableOpacity>
                 </View>
 
+                    <TouchableOpacity
+                      style={[
+                        styles.authMethodButton,
+                        { borderColor: theme.primary, backgroundColor: authMethodSelection === 'pattern' ? theme.primary : theme.surface }
+                      ]}
+                      onPress={() => setAuthMethodSelection('pattern')}
+                    >
+                      <Text style={[
+                        styles.authMethodText,
+                        { color: authMethodSelection === 'pattern' ? '#ffffff' : theme.primary }
+                      ]}>Pattern</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+
+                {authMethodSelection === 'password' && (
+                  <>
                 <View style={styles.inputContainer}>
                   <Lock size={20} color={theme.textSecondary} style={styles.inputIcon} />
                   <TextInput
@@ -445,12 +628,58 @@ export default function AuthGuard({ children }: AuthGuardProps) {
                     autoCapitalize="none"
                   />
                 </View>
+                  </>
+                )}
 
-                {/* Authentication Method Selection */}
+                {authMethodSelection === 'pin' && (
+                  <>
+                    <View style={styles.inputContainer}>
+                      <Lock size={20} color={theme.textSecondary} style={styles.inputIcon} />
+                      <TextInput
+                        style={[styles.input, { backgroundColor: theme.surface, borderColor: theme.border, color: theme.text }]}
+                        placeholder={currentLanguage === 'sw' ? 'Tengeneza PIN (4+ namba)' : 'Create PIN (4+ digits)'}
+                        placeholderTextColor={theme.textSecondary}
+                        secureTextEntry
+                        value={pinCode}
+                        onChangeText={setPinCode}
+                        keyboardType="numeric"
+                        maxLength={8}
+                      />
+                    </View>
+
+                    <View style={styles.inputContainer}>
+                      <Lock size={20} color={theme.textSecondary} style={styles.inputIcon} />
+                      <TextInput
+                        style={[styles.input, { backgroundColor: theme.surface, borderColor: theme.border, color: theme.text }]}
+                        placeholder={currentLanguage === 'sw' ? 'Thibitisha PIN' : 'Confirm PIN'}
+                        placeholderTextColor={theme.textSecondary}
+                        secureTextEntry
+                        value={confirmPinCode}
+                        onChangeText={setConfirmPinCode}
+                        keyboardType="numeric"
+                        maxLength={8}
+                      />
+                    </View>
+                  </>
+                )}
+
+                {authMethodSelection === 'pattern' && (
+                  <>
+                    <Text style={[styles.patternLabel, { color: theme.text }]}>
+                      {currentLanguage === 'sw' ? 'Tengeneza mchoro wako' : 'Create your pattern'}
+                    </Text>
+                    <PatternGrid onPatternChange={setPatternPoints} currentPattern={patternPoints} />
+                    
+                    <Text style={[styles.patternLabel, { color: theme.text }]}>
+                      {currentLanguage === 'sw' ? 'Thibitisha mchoro' : 'Confirm pattern'}
+                    </Text>
+                    <PatternGrid onPatternChange={setConfirmPatternPoints} currentPattern={confirmPatternPoints} />
+                  </>
+                )}
                 {biometricAvailable && (
                   <View style={styles.authMethodContainer}>
                     <Text style={[styles.authMethodTitle, { color: theme.text }]}>
-                      {currentLanguage === 'sw' ? 'Chagua njia ya kuingia:' : 'Choose login method:'}
+                      {currentLanguage === 'sw' ? 'Ongeza fingerprint?' : 'Add fingerprint?'}
                     </Text>
                     <View style={styles.authMethodButtons}>
                       <TouchableOpacity
@@ -460,11 +689,10 @@ export default function AuthGuard({ children }: AuthGuardProps) {
                         ]}
                         onPress={() => setAuthMethod('password')}
                       >
-                        <Lock size={20} color={authMethod === 'password' ? '#ffffff' : theme.primary} />
                         <Text style={[
                           styles.authMethodText,
                           { color: authMethod === 'password' ? '#ffffff' : theme.primary }
-                        ]}>Password</Text>
+                        ]}>{currentLanguage === 'sw' ? 'Hapana' : 'No'}</Text>
                       </TouchableOpacity>
 
                       <TouchableOpacity
@@ -478,7 +706,7 @@ export default function AuthGuard({ children }: AuthGuardProps) {
                         <Text style={[
                           styles.authMethodText,
                           { color: authMethod === 'biometric' ? '#ffffff' : theme.primary }
-                        ]}>Fingerprint</Text>
+                        ]}>{currentLanguage === 'sw' ? 'Ndio' : 'Yes'}</Text>
                       </TouchableOpacity>
                     </View>
                   </View>
@@ -786,5 +1014,46 @@ const styles = StyleSheet.create({
   },
   footerText: {
     fontSize: 14,
+  },
+  workDayItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 8,
+    borderWidth: 1,
+  },
+  workDayName: {
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  workDayDate: {
+    fontSize: 14,
+  },
+  todayBadge: {
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  patternGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    width: 120,
+    height: 120,
+    alignSelf: 'center',
+    marginVertical: 16,
+  },
+  patternPoint: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: '#e5e7eb',
+    margin: 4,
+  },
+  patternLabel: {
+    fontSize: 14,
+    fontWeight: '500',
+    marginBottom: 8,
+    textAlign: 'center',
   },
 });

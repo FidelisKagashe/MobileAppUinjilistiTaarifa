@@ -34,6 +34,7 @@ import { LanguageService, Translations } from '@/services/LanguageService';
 import { UserProfile } from '@/types/Report';
 import { router } from 'expo-router';
 import { useTheme } from '../providers/ThemeProvider';
+import ChangePasswordModal from '@/components/ChangePasswordModal';
 
 type LangKey = 'sw' | 'en';
 
@@ -49,6 +50,9 @@ export default function SettingsScreen() {
   const [editPhone, setEditPhone] = useState('');
   const [translations, setTranslations] = useState<Translations | null>(null);
   const [currentLanguage, setCurrentLanguage] = useState<LangKey>('sw');
+
+  // Change password modal state
+  const [showChangePasswordModal, setShowChangePasswordModal] = useState(false);
 
   useEffect(() => {
     let unsub: (() => void) | null = null;
@@ -205,9 +209,12 @@ export default function SettingsScreen() {
   };
 
   const changePassword = () => {
-    Alert.alert(translations?.changePassword ?? 'Badilisha Password', 'Utaratibu wa kubadilisha password utaongezwa katika toleo lijalo.', [
-      { text: translations?.ok ?? 'Sawa' },
-    ]);
+    setShowChangePasswordModal(true);
+  };
+
+  const handlePasswordChangeSuccess = () => {
+    // Optionally show success message or refresh data
+    console.log('Password changed successfully');
   };
 
   const handleLogout = () => {
@@ -222,7 +229,9 @@ export default function SettingsScreen() {
           onPress: async () => {
             try {
               await DataService.logout();
-              router.replace('/');
+              // Force complete app restart by clearing navigation stack
+              router.dismissAll();
+              router.replace('/(tabs)');
             } catch (error) {
               console.error('logout error:', error);
               Alert.alert(
@@ -503,6 +512,12 @@ export default function SettingsScreen() {
           <Text style={[styles.footerText, { color: theme.textSecondary }]}>© 2025 Kanisa la SDA - Programu ya DODOMA CTF ya Uuzaji wa Wanafunzi</Text>
         </View>
       </ScrollView>
+      
+      <ChangePasswordModal
+        visible={showChangePasswordModal}
+        onClose={() => setShowChangePasswordModal(false)}
+        onSuccess={handlePasswordChangeSuccess}
+      />
     </SafeAreaView>
   );
 }

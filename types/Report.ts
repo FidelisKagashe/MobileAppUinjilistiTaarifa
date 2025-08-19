@@ -79,8 +79,37 @@ export interface AppSettings {
   autoLockWeeks: boolean;
   reminderNotifications: boolean;
   lastBackup: string | null;
-  authMethod: 'password' | 'biometric' | 'pattern';
+  authMethod: 'password' | 'biometric' | 'pattern' | 'pin';
   theme: 'light' | 'dark';
   language: 'sw' | 'en';
   firstUseDate: string | null;
+}
+
+export interface WorkDay {
+  date: string;
+  dayName: string;
+  isToday: boolean;
+  isCompleted: boolean;
+}
+
+export interface WorkWeekInfo {
+  weekStartDate: string;
+  weekEndDate: string;
+  workDays: WorkDay[];
+  isActive: boolean;
+  weekNumber: number;
+}
+
+export interface WeekSummaryReport {
+  studentName: string;
+  weekInfo: WorkWeekInfo;
+  dailyReports: DailyReport[];
+  summary: {
+    totalHours: number;
+    totalSales: number;
+    totalBooks: number;
+    daysWorked: number;
+    averageHoursPerDay: number;
+  };
+  generatedAt: string;
 }

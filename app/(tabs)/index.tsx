@@ -13,8 +13,9 @@ import { Plus, FileText, Book, DollarSign, Clock, CircleAlert as AlertCircle, Ch
 import { router } from 'expo-router';
 import { DataService } from '@/services/DataService';
 import { LanguageService } from '@/services/LanguageService';
-import { WeeklyReport, DailyReport, UserProfile } from '@/types/Report';
+import { WeeklyReport, DailyReport, UserProfile, WeekSummaryReport } from '@/types/Report';
 import { useTheme } from '../providers/ThemeProvider';
+import WeekSummaryModal from '@/components/WeekSummaryModal';
 
 export default function DashboardScreen() {
   const { theme } = useTheme();
@@ -27,6 +28,10 @@ export default function DashboardScreen() {
   const [totalSales, setTotalSales] = useState(0);
   const [totalBooks, setTotalBooks] = useState(0);
   const [loading, setLoading] = useState(true);
+
+  // Week summary modal state
+  const [showWeekSummary, setShowWeekSummary] = useState(false);
+  const [weekSummaryData, setWeekSummaryData] = useState<WeekSummaryReport | null>(null);
 
   // small tick to force rerender on language change
   const [langTick, setLangTick] = useState(0);
@@ -65,11 +70,33 @@ export default function DashboardScreen() {
 
       setTotalSales(sales);
       setTotalBooks(books);
+      
+      // Check if we should show week summary (end of week)
+      await checkAndShowWeekSummary();
     } catch (error) {
       console.error('Error loading dashboard data:', error);
       Alert.alert(LanguageService.t('error'), LanguageService.t('networkError'));
     } finally {
       setLoading(false);
+    }
+  };
+
+  const checkAndShowWeekSummary = async () => {
+    try {
+      const today = new Date();
+      const dayOfWeek = today.getDay(); // 0 = Sunday, 5 = Friday
+      const currentHour = today.getHours();
+      
+      // Show summary on Friday after 6 PM or on Saturday
+      if ((dayOfWeek === 5 && currentHour >= 18) || dayOfWeek === 6) {
+        const summary = await DataService.generateWeekSummaryReport();
+        if (summary) {
+          setWeekSummaryData(summary);
+          setShowWeekSummary(true);
+        }
+      }
+    } catch (error) {
+      console.error('Error checking week summary:', error);
     }
   };
 
@@ -261,6 +288,12 @@ export default function DashboardScreen() {
           </View>
         </View>
       </ScrollView>
+      
+      <WeekSummaryModal
+        visible={showWeekSummary}
+        onClose={() => setShowWeekSummary(false)}
+        weekSummary={weekSummaryData}
+      />
     </SafeAreaView>
   );
 }

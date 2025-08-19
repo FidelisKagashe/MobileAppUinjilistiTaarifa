@@ -7,6 +7,9 @@ import {
   MonthlyReport,
   UserProfile,
   AppSettings,
+  WorkWeekInfo,
+  WorkDay,
+  WeekSummaryReport,
 } from '@/types/Report';
 
 const STORAGE_KEYS = {
@@ -19,6 +22,8 @@ const STORAGE_KEYS = {
   WEEK_COUNTER: '@dodoma_ctf_week_counter',
   DATA_VERSION: '@dodoma_ctf_data_version',
   LAST_SYNC: '@dodoma_ctf_last_sync',
+  FIRST_LOGIN_DATE: '@dodoma_ctf_first_login_date',
+  CURRENT_WORK_WEEK: '@dodoma_ctf_current_work_week',
 };
 
 const CURRENT_DATA_VERSION = '2.1.0';
@@ -332,6 +337,23 @@ export class DataService {
     }
   }
 
+  static async changePassword(currentPassword: string, newPassword: string): Promise<void> {
+    await this.initialize();
+    try {
+      // Verify current password first
+      const isCurrentValid = await this.verifyPassword(currentPassword);
+      if (!isCurrentValid) {
+        throw new Error('Current password is incorrect');
+      }
+      
+      // Set new password
+      await AsyncStorage.setItem(STORAGE_KEYS.PASSWORD, newPassword);
+      await this.updateLastSync();
+    } catch (error) {
+      console.error('Error changing password:', error);
+      throw error;
+    }
+  }
   static async verifyPassword(password: string): Promise<boolean> {
     await this.initialize();
     try {
@@ -508,13 +530,138 @@ export class DataService {
   // -----------------------
   static async logout(): Promise<void> {
     try {
-      // Clear sensitive data but keep user profile and settings
-      await AsyncStorage.multiRemove([STORAGE_KEYS.PASSWORD]);
+      // Complete logout - clear all authentication data
+      await AsyncStorage.multiRemove([
+        STORAGE_KEYS.PASSWORD,
+        '@auth_failed_attempts',
+        '@auth_lock_until'
+      ]);
+      
+      // Reset authentication state
+      await this.updateSettings({ 
+        biometricEnabled: false,
+        authMethod: 'password'
+      });
     } catch (error) {
+      console.error('Logout error:', error);
       throw new Error('Failed to logout');
     }
   }
 
+  // -----------------------
+  // First-Time Login & Work Week Tracking
+  // -----------------------
+  static async recordFirstLogin(): Promise<void> {
+    try {
+      const firstLoginDate = await AsyncStorage.getItem(STORAGE_KEYS.FIRST_LOGIN_DATE);
+      if (!firstLoginDate) {
+        const now = new Date();
+        await AsyncStorage.setItem(STORAGE_KEYS.FIRST_LOGIN_DATE, now.toISOString());
+        
+        // Calculate and store current work week
+        const workWeek = this.calculateCurrentWorkWeek(now);
+        await AsyncStorage.setItem(STORAGE_KEYS.CURRENT_WORK_WEEK, JSON.stringify(workWeek));
+        
+        return;
+      }
+    } catch (error) {
+      console.error('Error recording first login:', error);
+    }
+  }
+
+  static async isFirstTimeLogin(): Promise<boolean> {
+    try {
+      const firstLoginDate = await AsyncStorage.getItem(STORAGE_KEYS.FIRST_LOGIN_DATE);
+      return !firstLoginDate;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  static async getCurrentWorkWeek(): Promise<WorkWeekInfo | null> {
+    try {
+      const workWeekJson = await AsyncStorage.getItem(STORAGE_KEYS.CURRENT_WORK_WEEK);
+      return workWeekJson ? JSON.parse(workWeekJson) : null;
+    } catch (error) {
+      console.error('Error getting current work week:', error);
+      return null;
+    }
+  }
+
+  private static calculateCurrentWorkWeek(date: Date): WorkWeekInfo {
+    // Find Monday of current week
+    const currentDay = date.getDay(); // 0 = Sunday, 1 = Monday, etc.
+    const daysFromMonday = currentDay === 0 ? 6 : currentDay - 1; // Sunday = 6 days from Monday
+    
+    const monday = new Date(date);
+    monday.setDate(date.getDate() - daysFromMonday);
+    monday.setHours(0, 0, 0, 0);
+    
+    // Friday at 6:00 PM
+    const friday = new Date(monday);
+    friday.setDate(monday.getDate() + 4); // Friday is 4 days after Monday
+    friday.setHours(18, 0, 0, 0);
+    
+    // Generate work days (Monday to Friday)
+    const workDays: WorkDay[] = [];
+    for (let i = 0; i < 5; i++) {
+      const day = new Date(monday);
+      day.setDate(monday.getDate() + i);
+      workDays.push({
+        date: day.toISOString().split('T')[0],
+        dayName: this.getDayName(day),
+        isToday: day.toDateString() === date.toDateString(),
+        isCompleted: false
+      });
+    }
+    
+    return {
+      weekStartDate: monday.toISOString().split('T')[0],
+      weekEndDate: friday.toISOString().split('T')[0],
+      workDays,
+      isActive: date < friday,
+      weekNumber: this.getWeekNumber(monday)
+    };
+  }
+
+  private static getWeekNumber(date: Date): number {
+    const start = new Date(date.getFullYear(), 0, 1);
+    const days = Math.floor((date.getTime() - start.getTime()) / (24 * 60 * 60 * 1000));
+    return Math.ceil((days + start.getDay() + 1) / 7);
+  }
+
+  static async generateWeekSummaryReport(): Promise<WeekSummaryReport | null> {
+    try {
+      const workWeek = await this.getCurrentWorkWeek();
+      if (!workWeek) return null;
+      
+      const dailyReports = await this.getDailyReportsForWeek(workWeek.weekStartDate);
+      const profile = await this.getUserProfile();
+      
+      if (!profile) return null;
+      
+      const totalHours = dailyReports.reduce((sum, r) => sum + (r.hoursWorked || 0), 0);
+      const totalSales = dailyReports.reduce((sum, r) => sum + (r.dailyAmount || 0), 0);
+      const totalBooks = dailyReports.reduce((sum, r) => sum + (r.booksSold || 0), 0);
+      
+      return {
+        studentName: profile.fullName,
+        weekInfo: workWeek,
+        dailyReports,
+        summary: {
+          totalHours,
+          totalSales,
+          totalBooks,
+          daysWorked: dailyReports.length,
+          averageHoursPerDay: dailyReports.length > 0 ? totalHours / dailyReports.length : 0
+        },
+        generatedAt: new Date().toISOString()
+      };
+    } catch (error) {
+      console.error('Error generating week summary:', error);
+      return null;
+    }
+  }
   // -----------------------
   // Utility Functions
   // -----------------------
