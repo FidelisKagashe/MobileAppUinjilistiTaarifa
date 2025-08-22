@@ -1,3 +1,7 @@
+// types/Report.ts
+
+export type AuthMethod = 'password' | 'biometric' | 'pattern' | 'pin';
+
 export interface BookSale {
   id: string;
   title: string;
@@ -74,12 +78,26 @@ export interface UserProfile {
   updatedAt: string;
 }
 
+/**
+ * AppSettings
+ * - authMethod is the canonical stored method ('password' by default).
+ * - primaryAuthMethod and authMethodSelection are optional helper fields used
+ *   by some components (made optional to avoid TS errors). Prefer reading/writing
+ *   settings via DataService.getSettings()/updateSettings().
+ */
 export interface AppSettings {
   biometricEnabled: boolean;
   autoLockWeeks: boolean;
   reminderNotifications: boolean;
   lastBackup: string | null;
-  authMethod: 'password' | 'biometric' | 'pattern' | 'pin';
+
+  // canonical auth method stored for the app
+  authMethod: AuthMethod;
+
+  // optional legacy/helper fields (some components referenced these names)
+  primaryAuthMethod?: AuthMethod;
+  authMethodSelection?: AuthMethod;
+
   theme: 'light' | 'dark';
   language: 'sw' | 'en';
   firstUseDate: string | null;

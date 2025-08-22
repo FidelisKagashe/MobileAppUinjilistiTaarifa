@@ -1,5 +1,5 @@
 // app/(tabs)/analytics.tsx  (patched)
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef, useMemo, useCallback } from 'react';
 import {
   View,
   Text,
@@ -7,6 +7,7 @@ import {
   ScrollView,
   Dimensions,
   TouchableOpacity,
+  ActivityIndicator,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { LineChart, BarChart, PieChart } from 'react-native-chart-kit';
@@ -26,37 +27,91 @@ export default function AnalyticsScreen() {
   const [loading, setLoading] = useState(true);
   const [viewMode, setViewMode] = useState<'weekly' | 'daily'>('weekly');
 
+  // mounted ref to prevent state updates after unmount
+  const mountedRef = useRef(true);
+
   // small tick to force re-render on language change
   const [, setLangTick] = useState(0);
 
-  useEffect(() => {
-    (async () => {
-      await DataService.initialize();
-      await LanguageService.initialize();
-      await loadAnalyticsData();
+  // Helper t: accepts either keyof Translations or plain string fallback
+  const t = useCallback((key: string, fallback?: string) => {
+    // LanguageService.t has strict typing in your project; cast to any to avoid TS error when passing dynamic strings
+    try {
+      const result = (LanguageService.t as any)(key);
+      return result ?? fallback ?? key;
+    } catch {
+      return fallback ?? key;
+    }
+  }, []);
 
-      const unsubscribe = (LanguageService as any).subscribe ? (LanguageService as any).subscribe(() => setLangTick(t => t + 1)) : undefined;
-      return () => unsubscribe && unsubscribe();
+  useEffect(() => {
+    mountedRef.current = true;
+    let unsubLang: (() => void) | undefined;
+    let unsubReports: (() => void) | undefined;
+    let unsubProfile: (() => void) | undefined;
+    let unsubSettings: (() => void) | undefined;
+
+    (async () => {
+      try {
+        await DataService.initialize();
+        await LanguageService.initialize();
+        await loadAnalyticsData();
+
+        // Subscribe to language changes to re-render translated strings
+        unsubLang = LanguageService.subscribe(() => {
+          if (mountedRef.current) setLangTick((t) => t + 1);
+        });
+        
+        // Subscribe to DataService events for live updates
+        unsubReports = DataService.subscribe('reportsUpdated', () => {
+          if (mountedRef.current) loadAnalyticsData();
+        });
+        
+        unsubProfile = DataService.subscribe('profileUpdated', () => {
+          if (mountedRef.current) loadAnalyticsData();
+        });
+        
+        unsubSettings = DataService.subscribe('settingsUpdated', () => {
+          if (mountedRef.current) loadAnalyticsData();
+        });
+      } catch (err) {
+        console.error('init analytics error', err);
+      } finally {
+        if (mountedRef.current) setLoading(false);
+      }
     })();
+
+    return () => {
+      mountedRef.current = false;
+      if (typeof unsubLang === 'function') unsubLang();
+      if (typeof unsubReports === 'function') unsubReports();
+      if (typeof unsubProfile === 'function') unsubProfile();
+      if (typeof unsubSettings === 'function') unsubSettings();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const loadAnalyticsData = async () => {
+  const loadAnalyticsData = useCallback(async () => {
     try {
       const weekly = await DataService.getAllWeeklyReports();
       const daily = await DataService.getAllDailyReports();
 
-      setWeeklyReports(weekly.sort((a, b) => a.weekNumber - b.weekNumber));
-      setDailyReports(daily.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()));
+      if (!mountedRef.current) return;
+
+      // defensive sorting
+      const w = (weekly || []).slice().sort((a, b) => (a.weekNumber || 0) - (b.weekNumber || 0));
+      const d = (daily || []).slice().sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+
+      setWeeklyReports(w);
+      setDailyReports(d);
     } catch (error) {
       console.error('Error loading analytics data:', error);
-    } finally {
-      setLoading(false);
     }
-  };
+  }, []);
 
   // convert hex to rgba
   const hexToRgba = (hex: string, alpha = 1) => {
+    if (!hex) return `rgba(0,0,0,${alpha})`;
     const h = hex.replace('#', '');
     const normalized = h.length === 3 ? h.split('').map(c => c + c).join('') : h;
     const bigint = parseInt(normalized, 16);
@@ -66,38 +121,25 @@ export default function AnalyticsScreen() {
     return `rgba(${r}, ${g}, ${b}, ${alpha})`;
   };
 
-  const chartConfig = {
+  // chartConfig memoized so charts don't re-create unnecessarily
+  const chartConfig = useMemo(() => ({
     backgroundColor: theme.card,
     backgroundGradientFrom: theme.card,
     backgroundGradientTo: theme.card,
     decimalPlaces: 0,
     color: (opacity = 1) => hexToRgba(theme.primary, opacity),
     labelColor: (opacity = 1) => hexToRgba(theme.text, opacity),
-    style: {
-      borderRadius: 16,
-    },
-    propsForDots: {
-      r: '6',
-      strokeWidth: '2',
-      stroke: theme.primary,
-    },
-  };
+    style: { borderRadius: 16 },
+    propsForDots: { r: '6', strokeWidth: '2', stroke: theme.primary },
+  }), [theme]);
 
-  // --- SAFEGUARDED DATA PREPARATION ---
+  // --- prepare data slices safely (memoized) ---
+  const weeklySlice = useMemo(() => weeklyReports.slice(-6), [weeklyReports]);
+  const weeklyLabels = useMemo(() => (weeklySlice.length ? weeklySlice.map((_, i) => `W${i + 1}`) : ['-']), [weeklySlice]);
+  const weeklyAmounts = useMemo(() => (weeklySlice.length ? weeklySlice.map(r => Number(r.totalAmount || 0)) : [0]), [weeklySlice]);
+  const weeklyHours = useMemo(() => (weeklySlice.length ? weeklySlice.map(r => Number(r.totalHours || 0)) : [0]), [weeklySlice]);
 
-  // Weekly slice (last up-to-6 weeks)
-  const weeklySlice = weeklyReports.slice(-6);
-  const weeklyLabels = weeklySlice.length
-    ? weeklySlice.map((r, i) => `W${i + 1}`)
-    : ['-'];
-  const weeklyAmounts = weeklySlice.length
-    ? weeklySlice.map((report) => Number(report.totalAmount || 0))
-    : [0];
-  const weeklyHours = weeklySlice.length
-    ? weeklySlice.map((report) => Number(report.totalHours || 0))
-    : [0];
-
-  const weeklySalesData = {
+  const weeklySalesData = useMemo(() => ({
     labels: weeklyLabels,
     datasets: [
       {
@@ -106,28 +148,20 @@ export default function AnalyticsScreen() {
         strokeWidth: 2,
       },
     ],
-  };
+  }), [weeklyLabels, weeklyAmounts, theme]);
 
-  const weeklyHoursData = {
-    labels: weeklySlice.length
-      ? weeklySlice.map((r, i) => `${LanguageService.t('weekActive')} ${i + 1}`)
-      : ['-'],
+  const weeklyHoursData = useMemo(() => ({
+    labels: weeklySlice.length ? weeklySlice.map((_, i) => `${t('weekActive', 'Week')} ${i + 1}`) : ['-'],
     datasets: [{ data: weeklyHours }],
-  };
+  }), [weeklySlice, weeklyHours, t]);
 
-  // Daily slice (last 7 days)
-  const dailySlice = dailyReports.slice(-7);
-  const dailyLabels = dailySlice.length
-    ? dailySlice.map((r) => LanguageService.getDayName(new Date(r.date)).substring(0, 3))
-    : ['-'];
-  const dailyAmounts = dailySlice.length
-    ? dailySlice.map((r) => Number(r.dailyAmount || 0))
-    : [0];
-  const dailyHours = dailySlice.length
-    ? dailySlice.map((r) => Number(r.hoursWorked || 0))
-    : [0];
+  // daily
+  const dailySlice = useMemo(() => dailyReports.slice(-7), [dailyReports]);
+  const dailyLabels = useMemo(() => (dailySlice.length ? dailySlice.map(r => LanguageService.getDayName(new Date(r.date)).substring(0, 3)) : ['-']), [dailySlice]);
+  const dailyAmounts = useMemo(() => (dailySlice.length ? dailySlice.map(r => Number(r.dailyAmount || 0)) : [0]), [dailySlice]);
+  const dailyHours = useMemo(() => (dailySlice.length ? dailySlice.map(r => Number(r.hoursWorked || 0)) : [0]), [dailySlice]);
 
-  const dailySalesData = {
+  const dailySalesData = useMemo(() => ({
     labels: dailyLabels,
     datasets: [
       {
@@ -136,47 +170,37 @@ export default function AnalyticsScreen() {
         strokeWidth: 2,
       },
     ],
-  };
+  }), [dailyLabels, dailyAmounts, theme]);
 
-  const dailyHoursData = {
+  const dailyHoursData = useMemo(() => ({
     labels: dailyLabels,
     datasets: [{ data: dailyHours }],
-  };
+  }), [dailyLabels, dailyHours]);
 
-  const activityData = [
-    {
-      name: LanguageService.t('bibleStudies'),
-      population: weeklyReports.reduce((sum, r) => sum + Number(r.totalBibleStudies || 0), 0),
-      color: theme.primary,
-      legendFontColor: theme.text,
-      legendFontSize: 12,
-    },
-    {
-      name: LanguageService.t('prayersOffered'),
-      population: weeklyReports.reduce((sum, r) => sum + Number(r.totalPrayersOffered || 0), 0),
-      color: theme.success,
-      legendFontColor: theme.text,
-      legendFontSize: 12,
-    },
-    {
-      name: LanguageService.t('peopleVisited'),
-      population: weeklyReports.reduce((sum, r) => sum + Number(r.totalPeopleVisited || 0), 0),
-      color: theme.error,
-      legendFontColor: theme.text,
-      legendFontSize: 12,
-    },
-    {
-      name: LanguageService.t('baptismsPerformed'),
-      population: weeklyReports.reduce((sum, r) => sum + Number(r.totalBaptismsPerformed || 0), 0),
-      color: theme.warning,
-      legendFontColor: theme.text,
-      legendFontSize: 12,
-    },
-  ];
+  // activityData (pie)
+  const activityData = useMemo(() => {
+    const bibleStudies = weeklyReports.reduce((sum, r) => sum + Number(r.totalBibleStudies || 0), 0);
+    const prayers = weeklyReports.reduce((sum, r) => sum + Number(r.totalPrayersOffered || 0), 0);
+    const visited = weeklyReports.reduce((sum, r) => sum + Number(r.totalPeopleVisited || 0), 0);
+    const baptisms = weeklyReports.reduce((sum, r) => sum + Number(r.totalBaptismsPerformed || 0), 0);
 
-  // helper: detect "empty" dataset (all zeros)
-  const allZeros = (arr: number[]) => arr.every((n) => !n);
+    return [
+      { name: t('bibleStudies', 'Bible studies'), population: bibleStudies, color: theme.primary, legendFontColor: theme.text, legendFontSize: 12 },
+      { name: t('prayersOffered', 'Prayers'), population: prayers, color: theme.success, legendFontColor: theme.text, legendFontSize: 12 },
+      { name: t('peopleVisited', 'Visited'), population: visited, color: theme.error, legendFontColor: theme.text, legendFontSize: 12 },
+      { name: t('baptismsPerformed', 'Baptisms'), population: baptisms, color: theme.warning, legendFontColor: theme.text, legendFontSize: 12 },
+    ];
+  }, [weeklyReports, theme, t]);
 
+  const allZeros = useCallback((arr: number[]) => arr.every(n => !n), []);
+
+  // Key metrics
+  const totalSales = useMemo(() => weeklyReports.reduce((sum, r) => sum + Number(r.totalAmount || 0), 0), [weeklyReports]);
+  const totalHours = useMemo(() => weeklyReports.reduce((sum, r) => sum + Number(r.totalHours || 0), 0), [weeklyReports]);
+  const totalBooks = useMemo(() => weeklyReports.reduce((sum, r) => sum + Number(r.totalBooksSold || 0), 0), [weeklyReports]);
+  const averageWeeklySales = useMemo(() => (weeklyReports.length > 0 ? Math.round(totalSales / weeklyReports.length) : 0), [weeklyReports, totalSales]);
+
+  // UI components
   const MetricCard = ({ title, value, subtitle, icon: Icon, color }: any) => (
     <View style={[styles.metricCard, { borderTopColor: color, backgroundColor: theme.card }]}>
       <View style={styles.metricHeader}>
@@ -193,31 +217,32 @@ export default function AnalyticsScreen() {
       <TouchableOpacity
         style={[styles.viewModeButton, viewMode === 'daily' ? { backgroundColor: theme.primary } : undefined]}
         onPress={() => setViewMode('daily')}
+        accessibilityLabel="view-daily"
       >
-        <Text style={[styles.viewModeText, viewMode === 'daily' ? { color: theme.surface } : { color: theme.textSecondary }]}>
-          {LanguageService.t('dailyReport')}
-        </Text>
+        <Text style={[styles.viewModeText, viewMode === 'daily' ? { color: theme.surface } : { color: theme.textSecondary }]}>{t('dailyReport', 'Daily')}</Text>
       </TouchableOpacity>
       <TouchableOpacity
         style={[styles.viewModeButton, viewMode === 'weekly' ? { backgroundColor: theme.primary } : undefined]}
         onPress={() => setViewMode('weekly')}
+        accessibilityLabel="view-weekly"
       >
-        <Text style={[styles.viewModeText, viewMode === 'weekly' ? { color: theme.surface } : { color: theme.textSecondary }]}>
-          {LanguageService.t('weeklyReport')}
-        </Text>
+        <Text style={[styles.viewModeText, viewMode === 'weekly' ? { color: theme.surface } : { color: theme.textSecondary }]}>{t('weeklyReport', 'Weekly')}</Text>
       </TouchableOpacity>
     </View>
   );
 
-  const totalSales = weeklyReports.reduce((sum, report) => sum + (Number(report.totalAmount) || 0), 0);
-  const totalHours = weeklyReports.reduce((sum, report) => sum + (Number(report.totalHours) || 0), 0);
-  const totalBooks = weeklyReports.reduce((sum, report) => sum + (Number(report.totalBooksSold) || 0), 0);
-  const averageWeeklySales = weeklyReports.length > 0 ? Math.round(totalSales / weeklyReports.length) : 0;
+  // pick current data
+  const currentData = viewMode === 'weekly' ? weeklyReports : dailyReports;
+  const salesData = viewMode === 'weekly' ? weeklySalesData : dailySalesData;
+  const hoursData = viewMode === 'weekly' ? weeklyHoursData : dailyHoursData;
 
   if (loading) {
     return (
       <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
-        <Text style={[styles.loadingText, { color: theme.textSecondary }]}>{LanguageService.t('loading')}</Text>
+        <View style={{ marginTop: 40, alignItems: 'center' }}>
+          <ActivityIndicator size="large" color={theme.primary} />
+          <Text style={[styles.loadingText, { color: theme.textSecondary, marginTop: 12 }]}>{t('loading', 'Loading...')}</Text>
+        </View>
       </SafeAreaView>
     );
   }
@@ -227,75 +252,42 @@ export default function AnalyticsScreen() {
       <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
         <View style={styles.emptyState}>
           <BarChart3 size={64} color={theme.textSecondary} />
-          <Text style={[styles.emptyStateTitle, { color: theme.text }]}>{LanguageService.t('noAnalytics')}</Text>
-          <Text style={[styles.emptyStateText, { color: theme.textSecondary }]}>{LanguageService.t('submitFirstReport')}</Text>
+          <Text style={[styles.emptyStateTitle, { color: theme.text }]}>{t('noAnalytics', 'No analytics')}</Text>
+          <Text style={[styles.emptyStateText, { color: theme.textSecondary }]}>{t('submitFirstReport', 'Submit your first report')}</Text>
         </View>
       </SafeAreaView>
     );
   }
 
-  const currentData = viewMode === 'weekly' ? weeklyReports : dailyReports;
-  const salesData = viewMode === 'weekly' ? weeklySalesData : dailySalesData;
-  const hoursData = viewMode === 'weekly' ? weeklyHoursData : dailyHoursData;
-
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
       <ScrollView showsVerticalScrollIndicator={false}>
-        {/* Header */}
         <View style={[styles.header, { backgroundColor: theme.primary }]}>
-          <Text style={[styles.headerTitle, { color: theme.surface }]}>{LanguageService.t('analyticsBoard')}</Text>
-          <Text style={[styles.headerSubtitle, { color: theme.surface + 'cc' }]}>{LanguageService.t('performanceInsights')}</Text>
+          <Text style={[styles.headerTitle, { color: theme.surface }]}>{t('analyticsBoard', 'Analytics')}</Text>
+          <Text style={[styles.headerSubtitle, { color: theme.surface + 'cc' }]}>{t('performanceInsights', 'Performance')}</Text>
         </View>
 
-        {/* View Mode Selector */}
         <ViewModeSelector />
 
-        {/* Key Metrics */}
         <View style={styles.section}>
-          <Text style={[styles.sectionTitle, { color: theme.text }]}>{LanguageService.t('keyMetrics')}</Text>
+          <Text style={[styles.sectionTitle, { color: theme.text }]}>{t('keyMetrics', 'Key metrics')}</Text>
           <View style={styles.metricsGrid}>
-            <MetricCard
-              title={LanguageService.t('totalSales')}
-              value={`TSH ${totalSales.toLocaleString()}`}
-              subtitle={LanguageService.t('allTimeSales')}
-              icon={DollarSign}
-              color={theme.success}
-            />
-            <MetricCard
-              title={LanguageService.t('weeklyAverage')}
-              value={`TSH ${averageWeeklySales.toLocaleString()}`}
-              subtitle={LanguageService.t('weeklyAverage')}
-              icon={TrendingUp}
-              color={theme.primary}
-            />
-            <MetricCard
-              title={LanguageService.t('totalHours')}
-              value={`${totalHours}`}
-              subtitle={LanguageService.t('totalHours')}
-              icon={Calendar}
-              color={theme.error}
-            />
-            <MetricCard
-              title={LanguageService.t('booksDistributed')}
-              value={`${totalBooks}`}
-              subtitle={LanguageService.t('booksDistributed')}
-              icon={Award}
-              color={theme.warning}
-            />
+            <MetricCard title={t('totalSales', 'Total sales')} value={`TSH ${totalSales.toLocaleString()}`} subtitle={t('allTimeSales', 'All time')} icon={DollarSign} color={theme.success} />
+            <MetricCard title={t('weeklyAverage', 'Weekly average')} value={`TSH ${averageWeeklySales.toLocaleString()}`} subtitle={t('weeklyAverage', 'Weekly average')} icon={TrendingUp} color={theme.primary} />
+            <MetricCard title={t('totalHours', 'Total hours')} value={`${totalHours}`} subtitle={t('totalHours', 'Total hours')} icon={Calendar} color={theme.error} />
+            <MetricCard title={t('booksDistributed', 'Books')} value={`${totalBooks}`} subtitle={t('booksDistributed', 'Books distributed')} icon={Award} color={theme.warning} />
           </View>
         </View>
 
-        {/* Sales Trend Chart */}
         {currentData.length > 1 && (
           <View style={styles.section}>
-            <Text style={[styles.sectionTitle, { color: theme.text }]}>{LanguageService.t('salesTrend')}</Text>
+            <Text style={[styles.sectionTitle, { color: theme.text }]}>{t('salesTrend', 'Sales trend')}</Text>
             <View style={[styles.chartContainer, { backgroundColor: theme.card }]}>
-              {/* key forces rerender when theme/data change */}
               <LineChart
-                key={`line-${viewMode}-${salesData.datasets[0].data.length}-${theme.primary}`}
+                key={`line-${viewMode}-${salesData.labels.length}-${theme.primary}`}
                 data={{
                   labels: salesData.labels,
-                  datasets: [{ ...salesData.datasets[0], data: salesData.datasets[0].data.map(n => Number(n || 0)) }],
+                  datasets: [{ ...salesData.datasets[0], data: salesData.datasets[0].data.map((n: any) => Number(n || 0)) }],
                 }}
                 width={screenWidth - 48}
                 height={220}
@@ -307,21 +299,18 @@ export default function AnalyticsScreen() {
                 yLabelsOffset={6}
               />
               {allZeros(salesData.datasets[0].data.map((n: any) => Number(n || 0))) && (
-                <Text style={[styles.chartEmptyText, { color: theme.textSecondary }]}>
-                  {LanguageService.t('noAnalytics')}
-                </Text>
+                <Text style={[styles.chartEmptyText, { color: theme.textSecondary }]}>{t('noAnalytics', 'No analytics')}</Text>
               )}
             </View>
           </View>
         )}
 
-        {/* Hours Worked Chart */}
         {currentData.length > 1 && (
           <View style={styles.section}>
-            <Text style={[styles.sectionTitle, { color: theme.text }]}>{LanguageService.t('hoursChart')}</Text>
+            <Text style={[styles.sectionTitle, { color: theme.text }]}>{t('hoursChart', 'Hours worked')}</Text>
             <View style={[styles.chartContainer, { backgroundColor: theme.card }]}>
               <BarChart
-                key={`bar-${viewMode}-${hoursData.datasets[0].data.length}-${theme.primary}`}
+                key={`bar-${viewMode}-${hoursData.labels.length}-${theme.primary}`}
                 data={{
                   labels: hoursData.labels,
                   datasets: [{ data: hoursData.datasets[0].data.map((n: any) => Number(n || 0)) }],
@@ -335,17 +324,14 @@ export default function AnalyticsScreen() {
                 fromZero
               />
               {allZeros(hoursData.datasets[0].data.map((n: any) => Number(n || 0))) && (
-                <Text style={[styles.chartEmptyText, { color: theme.textSecondary }]}>
-                  {LanguageService.t('noAnalytics')}
-                </Text>
+                <Text style={[styles.chartEmptyText, { color: theme.textSecondary }]}>{t('noAnalytics', 'No analytics')}</Text>
               )}
             </View>
           </View>
         )}
 
-        {/* Ministry Activities Distribution */}
         <View style={styles.section}>
-          <Text style={[styles.sectionTitle, { color: theme.text }]}>{LanguageService.t('ministryDistribution')}</Text>
+          <Text style={[styles.sectionTitle, { color: theme.text }]}>{t('ministryDistribution', 'Ministry distribution')}</Text>
           <View style={[styles.chartContainer, { backgroundColor: theme.card }]}>
             {activityData.filter(item => item.population > 0).length > 0 ? (
               <PieChart
@@ -360,9 +346,7 @@ export default function AnalyticsScreen() {
                 style={styles.chart}
               />
             ) : (
-              <Text style={[styles.chartEmptyText, { color: theme.textSecondary }]}>
-                {LanguageService.t('noAnalytics')}
-              </Text>
+              <Text style={[styles.chartEmptyText, { color: theme.textSecondary }]}>{t('noAnalytics', 'No analytics')}</Text>
             )}
           </View>
         </View>
@@ -372,118 +356,26 @@ export default function AnalyticsScreen() {
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-  },
-  header: {
-    padding: 24,
-  },
-  headerTitle: {
-    fontSize: 24,
-    fontWeight: 'bold',
-    marginBottom: 4,
-  },
-  headerSubtitle: {
-    fontSize: 14,
-    marginBottom: 8,
-  },
-  viewModeSelector: {
-    flexDirection: 'row',
-    margin: 16,
-    borderRadius: 8,
-    padding: 4,
-  },
-  viewModeButton: {
-    flex: 1,
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 6,
-    alignItems: 'center',
-  },
-  viewModeText: {
-    fontSize: 14,
-    fontWeight: '500',
-  },
-  section: {
-    margin: 16,
-  },
-  sectionTitle: {
-    fontSize: 18,
-    fontWeight: '600',
-    marginBottom: 16,
-  },
-  loadingText: {
-    textAlign: 'center',
-    fontSize: 16,
-    marginTop: 32,
-  },
-  emptyState: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    flex: 1,
-    padding: 32,
-  },
-  emptyStateTitle: {
-    fontSize: 20,
-    fontWeight: '600',
-    marginTop: 16,
-    marginBottom: 8,
-  },
-  emptyStateText: {
-    fontSize: 14,
-    textAlign: 'center',
-  },
-  metricsGrid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    marginHorizontal: -6,
-  },
-  metricCard: {
-    padding: 16,
-    borderRadius: 12,
-    margin: 6,
-    flex: 0.48,
-    borderTopWidth: 4,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 4,
-    elevation: 3,
-  },
-  metricHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginBottom: 8,
-  },
-  metricTitle: {
-    fontSize: 14,
-    fontWeight: '500',
-    marginLeft: 8,
-  },
-  metricValue: {
-    fontSize: 18,
-    fontWeight: 'bold',
-    marginBottom: 4,
-  },
-  metricSubtitle: {
-    fontSize: 12,
-  },
-  chartContainer: {
-    borderRadius: 16,
-    padding: 16,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 4,
-    elevation: 3,
-    minHeight: 120,
-    justifyContent: 'center',
-  },
-  chart: {
-    borderRadius: 16,
-  },
-  chartEmptyText: {
-    textAlign: 'center',
-    marginTop: 12,
-  },
+  container: { flex: 1 },
+  header: { padding: 24 },
+  headerTitle: { fontSize: 24, fontWeight: 'bold', marginBottom: 4 },
+  headerSubtitle: { fontSize: 14, marginBottom: 8 },
+  viewModeSelector: { flexDirection: 'row', margin: 16, borderRadius: 8, padding: 4 },
+  viewModeButton: { flex: 1, paddingVertical: 8, paddingHorizontal: 12, borderRadius: 6, alignItems: 'center' },
+  viewModeText: { fontSize: 14, fontWeight: '500' },
+  section: { margin: 16 },
+  sectionTitle: { fontSize: 18, fontWeight: '600', marginBottom: 16 },
+  loadingText: { textAlign: 'center', fontSize: 16, marginTop: 32 },
+  emptyState: { alignItems: 'center', justifyContent: 'center', flex: 1, padding: 32 },
+  emptyStateTitle: { fontSize: 20, fontWeight: '600', marginTop: 16, marginBottom: 8 },
+  emptyStateText: { fontSize: 14, textAlign: 'center' },
+  metricsGrid: { flexDirection: 'row', flexWrap: 'wrap', marginHorizontal: -6 },
+  metricCard: { padding: 16, borderRadius: 12, margin: 6, flex: 0.48, borderTopWidth: 4, shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.1, shadowRadius: 4, elevation: 3 },
+  metricHeader: { flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
+  metricTitle: { fontSize: 14, fontWeight: '500', marginLeft: 8 },
+  metricValue: { fontSize: 18, fontWeight: 'bold', marginBottom: 4 },
+  metricSubtitle: { fontSize: 12 },
+  chartContainer: { borderRadius: 16, padding: 16, shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.1, shadowRadius: 4, elevation: 3, minHeight: 120, justifyContent: 'center' },
+  chart: { borderRadius: 16 },
+  chartEmptyText: { textAlign: 'center', marginTop: 12 },
 });

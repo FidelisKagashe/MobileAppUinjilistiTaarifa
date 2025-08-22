@@ -1,13 +1,20 @@
 {
   "expo": {
-    "name": "bolt-expo-nativewind",
+    "name": "Evangelist's Notebook",
     "slug": "bolt-expo-nativewind",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
+    "splash": {
+      "image": "./assets/images/icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
     "scheme": "myapp",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
+    "platforms": ["ios", "android", "web"],
+    "assetBundlePatterns": ["**/*"],
     "ios": {
       "supportsTablet": true
     },
@@ -30,6 +37,10 @@
       "eas": {
         "projectId": "e37d3f7d-c3a2-4ae3-87f0-2d68bee76eb5"
       }
+    },
+    "updates": {
+      "enabled": true,
+      "fallbackToCacheTimeout": 0
     },
     "android": {
       "package": "com.fideliskagashe.boltexponativewind"

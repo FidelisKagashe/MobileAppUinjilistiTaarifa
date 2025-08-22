@@ -24,13 +24,50 @@ const STORAGE_KEYS = {
   LAST_SYNC: '@dodoma_ctf_last_sync',
   FIRST_LOGIN_DATE: '@dodoma_ctf_first_login_date',
   CURRENT_WORK_WEEK: '@dodoma_ctf_current_work_week',
+  RECOVERY_CODE: '@dodoma_ctf_recovery_code',
 };
 
 const CURRENT_DATA_VERSION = '2.1.0';
 
+type EventName = 'reportsUpdated' | 'settingsUpdated' | 'profileUpdated' | 'authUpdated' | 'dataCleared';
+
 export class DataService {
   private static isInitialized = false;
   private static initPromise: Promise<void> | null = null;
+
+  // simple in-memory event emitter
+  private static listeners: Partial<Record<EventName, Set<() => void>>> = {};
+
+  static subscribe(event: EventName, cb: () => void): () => void {
+    if (!this.listeners[event]) this.listeners[event] = new Set();
+    this.listeners[event]!.add(cb);
+    return () => {
+      this.listeners[event]!.delete(cb);
+    };
+  }
+
+  // --- BACKWARDS COMPATIBILITY helper many screens expect this name ---
+  static subscribeDataChanges(cb: () => void): () => void {
+    // subscribe to the 'reportsUpdated' event which indicates any report change
+    return this.subscribe('reportsUpdated', cb);
+  }
+
+  // Convenience to emit the reportsUpdated event
+  static emitDataChanges() {
+    this.emit('reportsUpdated');
+  }
+
+  private static emit(event: EventName) {
+    const set = this.listeners[event];
+    if (!set) return;
+    for (const cb of Array.from(set)) {
+      try {
+        cb();
+      } catch (err) {
+        console.warn('DataService listener error', err);
+      }
+    }
+  }
 
   // Initialize the service
   static async initialize(): Promise<void> {
@@ -44,13 +81,8 @@ export class DataService {
 
   private static async _performInitialization(): Promise<void> {
     try {
-      // Check data version and migrate if needed
       await this.checkAndMigrateData();
-      
-      // Initialize language service
       await LanguageService.initialize();
-      
-      // Set last sync time
       await AsyncStorage.setItem(STORAGE_KEYS.LAST_SYNC, new Date().toISOString());
     } catch (error) {
       console.error('DataService initialization error:', error);
@@ -60,9 +92,7 @@ export class DataService {
   private static async checkAndMigrateData(): Promise<void> {
     try {
       const currentVersion = await AsyncStorage.getItem(STORAGE_KEYS.DATA_VERSION);
-      
       if (!currentVersion || currentVersion !== CURRENT_DATA_VERSION) {
-        // Perform any necessary data migrations here
         await this.migrateData(currentVersion, CURRENT_DATA_VERSION);
         await AsyncStorage.setItem(STORAGE_KEYS.DATA_VERSION, CURRENT_DATA_VERSION);
       }
@@ -72,8 +102,8 @@ export class DataService {
   }
 
   private static async migrateData(fromVersion: string | null, toVersion: string): Promise<void> {
-    // Add migration logic here if needed in the future
     console.log(`Migrating data from ${fromVersion || 'unknown'} to ${toVersion}`);
+    // migration logic (if any) goes here
   }
 
   // -----------------------
@@ -84,6 +114,10 @@ export class DataService {
     try {
       await AsyncStorage.setItem(STORAGE_KEYS.USER_PROFILE, JSON.stringify(profile));
       await this.updateLastSync();
+      // Emit multiple events to ensure all components update
+      this.emit('profileUpdated');
+      this.emit('reportsUpdated');
+      this.emit('settingsUpdated');
     } catch (error) {
       console.error('Error saving user profile:', error);
       throw new Error('Failed to save user profile');
@@ -116,16 +150,38 @@ export class DataService {
   static async saveDailyReport(report: DailyReport): Promise<void> {
     await this.initialize();
     try {
+      // normalize numbers from bookSales if present
+      if (Array.isArray(report.bookSales)) {
+        const booksSoldFromDetails = report.bookSales.reduce((s, b) => s + (Number(b.quantity) || 0), 0);
+        const amountFromDetails = report.bookSales.reduce((s, b) => s + ((Number(b.price) || 0) * (Number(b.quantity) || 0)), 0);
+        // prefer explicit fields on report, otherwise fill from bookSales
+        report.booksSold = Number(report.booksSold ?? booksSoldFromDetails);
+        report.dailyAmount = Number(report.dailyAmount ?? amountFromDetails);
+      } else {
+        report.booksSold = Number(report.booksSold ?? 0);
+        report.dailyAmount = Number(report.dailyAmount ?? 0);
+      }
+
       const existingReports = await this.getAllDailyReports();
       const updatedReports = [...existingReports.filter(r => r.id !== report.id), report];
       await AsyncStorage.setItem(STORAGE_KEYS.DAILY_REPORTS, JSON.stringify(updatedReports));
       await this.updateLastSync();
 
-      // Auto-generate weekly report for the week that includes report.date
-      await this.generateWeeklyReport(report.date).catch(err => {
-        console.warn('generateWeeklyReport failed (non-fatal):', err);
-      });
+      console.log('[DataService] saveDailyReport saved, rebuilding weekly reports for consistency');
+
+      // Rebuild all weekly reports from daily data (keeps aggregates consistent)
+      try {
+        await this.rebuildWeeklyReportsFromDaily();
+      } catch (err) {
+        console.warn('rebuildWeeklyReportsFromDaily failed (non-fatal):', err);
+      }
+
+      // Emit multiple events to ensure all components update
+      this.emit('reportsUpdated');
+      this.emit('profileUpdated');
+      this.emit('settingsUpdated');
     } catch (error) {
+      console.error('saveDailyReport error', error);
       throw new Error('Failed to save daily report');
     }
   }
@@ -151,16 +207,29 @@ export class DataService {
     }
   }
 
+  /**
+   * Returns daily reports that fall inside the week that starts at weekStartDate (YYYY-MM-DD).
+   * NOTE: comparison is done by date strings (YYYY-MM-DD) to avoid timezone issues.
+   */
   static async getDailyReportsForWeek(weekStartDate: string): Promise<DailyReport[]> {
     try {
       const reports = await this.getAllDailyReports();
-      const weekStart = new Date(weekStartDate);
-      const weekEnd = new Date(weekStart);
-      weekEnd.setDate(weekEnd.getDate() + 4); // Sunday..Friday (5 days)
+      // Build allowed date strings (Sunday..Friday) using local dates to avoid timezone pitfalls
+      const weekStart = new Date(weekStartDate + 'T00:00:00');
+      const allowedDates: string[] = [];
+      for (let i = 0; i < 6; i++) {
+        const d = new Date(weekStart);
+        d.setDate(weekStart.getDate() + i);
+        const dayOfWeek = d.getDay();
+        if (dayOfWeek >= 0 && dayOfWeek <= 5) {
+          allowedDates.push(this.getDateString(d));
+        }
+      }
 
       return reports.filter(report => {
-        const reportDate = new Date(report.date);
-        return reportDate >= weekStart && reportDate <= weekEnd;
+        // report.date expected in 'YYYY-MM-DD' format. safeguard by splitting if time present.
+        const rd = (report.date || '').split('T')[0];
+        return allowedDates.includes(rd);
       });
     } catch (error) {
       console.error('Error loading weekly daily reports:', error);
@@ -174,29 +243,29 @@ export class DataService {
   static async generateWeeklyReport(dateInWeek: string): Promise<WeeklyReport> {
     try {
       const weekStart = this.getWeekStartDate(new Date(dateInWeek));
-      const weekEnd = new Date(weekStart);
-      weekEnd.setDate(weekEnd.getDate() + 4); // Friday
+      const weekEnd = this.getWeekEndDate(weekStart); // Friday 18:00
 
-      const dailyReports = await this.getDailyReportsForWeek(weekStart.toISOString().split('T')[0]);
+      const weekStartStr = weekStart.toISOString().split('T')[0];
+      // Use date-string based daily retrieval (avoids timezone off-by-one)
+      const dailyReports = await this.getDailyReportsForWeek(weekStartStr);
       const profile = await this.getUserProfile();
+      if (!profile) throw new Error('User profile not found');
 
-      if (!profile) {
-        throw new Error('User profile not found');
-      }
+      // Check if a weekly report for this week already exists
+      const existingWeekly = (await this.getAllWeeklyReports()).find(w => w.weekStartDate === weekStartStr);
+      let weekNumber = existingWeekly ? existingWeekly.weekNumber : this.getWeekNumber(weekStart);
 
-      // Use stored week counter to assign week number (increments)
-      const weekNumber = await this.getNextWeekNumber();
       const isCurrentWeekLocked = this.isWeekLocked(weekStart);
 
       const weeklyReport: WeeklyReport = {
-        id: `week_${weekStart.toISOString().split('T')[0]}`,
+        id: `week_${weekStartStr}`,
         weekNumber,
-        weekStartDate: weekStart.toISOString().split('T')[0],
+        weekStartDate: weekStartStr,
         weekEndDate: weekEnd.toISOString().split('T')[0],
         studentName: profile.fullName,
         phoneNumber: profile.phoneNumber,
         totalHours: dailyReports.reduce((sum, r) => sum + (r.hoursWorked || 0), 0),
-        totalBooksSold: dailyReports.reduce((sum, r) => sum + (r.booksSold || 0), 0),
+        totalBooksSold: dailyReports.reduce((sum, r) => sum + ((typeof r.booksSold === 'number' ? r.booksSold : (Array.isArray(r.bookSales) ? r.bookSales.reduce((s, b) => s + (Number(b.quantity)||0), 0) : 0)) ), 0),
         totalAmount: dailyReports.reduce((sum, r) => sum + (r.dailyAmount || 0), 0),
         totalFreeLiterature: dailyReports.reduce((sum, r) => sum + (r.freeLiterature || 0), 0),
         totalVopActivities: dailyReports.reduce((sum, r) => sum + (r.vopActivities || 0), 0),
@@ -209,7 +278,7 @@ export class DataService {
         totalPeopleVisited: dailyReports.reduce((sum, r) => sum + (r.peopleVisited || 0), 0),
         dailyReports,
         isLocked: isCurrentWeekLocked,
-        createdAt: new Date().toISOString(),
+        createdAt: existingWeekly?.createdAt || new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
 
@@ -225,9 +294,12 @@ export class DataService {
     await this.initialize();
     try {
       const existingReports = await this.getAllWeeklyReports();
-      const updatedReports = [...existingReports.filter(r => r.id !== report.id), report];
+      const updatedReports = [...existingReports.filter(r => r.id !== report.id), report].sort((a, b) => (a.weekNumber || 0) - (b.weekNumber || 0));
       await AsyncStorage.setItem(STORAGE_KEYS.WEEKLY_REPORTS, JSON.stringify(updatedReports));
       await this.updateLastSync();
+      console.log('[DataService] saved weekly report', report.id);
+      // notify that reports changed
+      this.emit('reportsUpdated');
     } catch (error) {
       console.error('Error saving weekly report:', error);
       throw new Error('Failed to save weekly report');
@@ -238,7 +310,9 @@ export class DataService {
     await this.initialize();
     try {
       const reportsJson = await AsyncStorage.getItem(STORAGE_KEYS.WEEKLY_REPORTS);
-      return reportsJson ? JSON.parse(reportsJson) : [];
+      const arr: WeeklyReport[] = reportsJson ? JSON.parse(reportsJson) : [];
+      // always return sorted by weekNumber ascending (safe)
+      return arr.sort((a, b) => (a.weekNumber || 0) - (b.weekNumber || 0));
     } catch (error) {
       console.error('Error loading weekly reports:', error);
       return [];
@@ -250,12 +324,77 @@ export class DataService {
       const today = new Date();
       const weekStart = this.getWeekStartDate(today);
       const weekId = `week_${weekStart.toISOString().split('T')[0]}`;
-
       const reports = await this.getAllWeeklyReports();
       return reports.find(report => report.id === weekId) || null;
     } catch (error) {
       console.error('Error loading current week report:', error);
       return null;
+    }
+  }
+
+  // rebuild all weekly reports from daily reports (bulk, authoritative)
+  private static async rebuildWeeklyReportsFromDaily(): Promise<WeeklyReport[]> {
+    await this.initialize();
+    try {
+      const dailyReports = await this.getAllDailyReports();
+      const profile = await this.getUserProfile();
+      const map: Record<string, { dailyReports: DailyReport[] }> = {};
+
+      for (const d of dailyReports) {
+        // canonicalize date string
+        const dateStr = (d.date || '').split('T')[0];
+        const weekStartDate = this.getWeekStartDate(new Date(dateStr)).toISOString().split('T')[0];
+        if (!map[weekStartDate]) map[weekStartDate] = { dailyReports: [] };
+        map[weekStartDate].dailyReports.push(d);
+      }
+
+      const weeklyArr: WeeklyReport[] = [];
+
+      for (const weekStartStr of Object.keys(map)) {
+        const weekStart = new Date(weekStartStr + 'T00:00:00');
+        const weekEnd = this.getWeekEndDate(weekStart);
+        const dailyForWeek = map[weekStartStr].dailyReports;
+        const weekNumber = this.getWeekNumber(weekStart);
+        const isLocked = this.isWeekLocked(weekStart);
+
+        const wr: WeeklyReport = {
+          id: `week_${weekStartStr}`,
+          weekNumber,
+          weekStartDate: weekStartStr,
+          weekEndDate: weekEnd.toISOString().split('T')[0],
+          studentName: profile?.fullName || '',
+          phoneNumber: profile?.phoneNumber || '',
+          totalHours: dailyForWeek.reduce((sum, r) => sum + (r.hoursWorked || 0), 0),
+          totalBooksSold: dailyForWeek.reduce((sum, r) => sum + ((typeof r.booksSold === 'number' ? r.booksSold : (Array.isArray(r.bookSales) ? r.bookSales.reduce((s, b) => s + (Number(b.quantity)||0), 0) : 0)) ), 0),
+          totalAmount: dailyForWeek.reduce((sum, r) => sum + (r.dailyAmount || 0), 0),
+          totalFreeLiterature: dailyForWeek.reduce((sum, r) => sum + (r.freeLiterature || 0), 0),
+          totalVopActivities: dailyForWeek.reduce((sum, r) => sum + (r.vopActivities || 0), 0),
+          totalChurchAttendees: dailyForWeek.reduce((sum, r) => sum + (r.churchAttendees || 0), 0),
+          totalBackSlidesVisited: dailyForWeek.reduce((sum, r) => sum + (r.backSlidesVisited || 0), 0),
+          totalPrayersOffered: dailyForWeek.reduce((sum, r) => sum + (r.prayersOffered || 0), 0),
+          totalBibleStudies: dailyForWeek.reduce((sum, r) => sum + (r.bibleStudies || 0), 0),
+          totalBaptismCandidates: dailyForWeek.reduce((sum, r) => sum + (r.baptismCandidates || 0), 0),
+          totalBaptismsPerformed: dailyForWeek.reduce((sum, r) => sum + (r.baptismsPerformed || 0), 0),
+          totalPeopleVisited: dailyForWeek.reduce((sum, r) => sum + (r.peopleVisited || 0), 0),
+          dailyReports: dailyForWeek,
+          isLocked,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+
+        weeklyArr.push(wr);
+      }
+
+      // sort ascending by weekNumber for stable ordering
+      weeklyArr.sort((a, b) => (a.weekNumber || 0) - (b.weekNumber || 0));
+      await AsyncStorage.setItem(STORAGE_KEYS.WEEKLY_REPORTS, JSON.stringify(weeklyArr));
+      await this.updateLastSync();
+      console.log('[DataService] rebuildWeeklyReportsFromDaily wrote', weeklyArr.length, 'weeks');
+      this.emit('reportsUpdated');
+      return weeklyArr;
+    } catch (error) {
+      console.error('rebuildWeeklyReportsFromDaily error:', error);
+      return [];
     }
   }
 
@@ -269,11 +408,8 @@ export class DataService {
         const reportDate = new Date(report.weekStartDate);
         return reportDate.getMonth() === month - 1 && reportDate.getFullYear() === year;
       });
-
       const profile = await this.getUserProfile();
-      if (!profile) {
-        throw new Error('User profile not found');
-      }
+      if (!profile) throw new Error('User profile not found');
 
       const monthlyReport: MonthlyReport = {
         id: `month_${year}_${month}`,
@@ -306,6 +442,11 @@ export class DataService {
       const updatedReports = [...existingReports.filter(r => r.id !== report.id), report];
       await AsyncStorage.setItem(STORAGE_KEYS.MONTHLY_REPORTS, JSON.stringify(updatedReports));
       await this.updateLastSync();
+      console.log('[DataService] saved monthly report', report.id);
+      // Emit multiple events to ensure all components update
+      this.emit('reportsUpdated');
+      this.emit('profileUpdated');
+      this.emit('settingsUpdated');
     } catch (error) {
       console.error('Error saving monthly report:', error);
       throw new Error('Failed to save monthly report');
@@ -326,42 +467,76 @@ export class DataService {
   // -----------------------
   // Authentication
   // -----------------------
-  static async setPassword(password: string): Promise<void> {
+  static async getAuthMethod(): Promise<'password' | 'pin' | 'pattern' | 'biometric'> {
+    try {
+      const settings = await this.getSettings();
+      const method = settings?.authMethod;
+      if (method === 'pin' || method === 'pattern' || method === 'biometric') return method;
+      return 'password';
+    } catch (error) {
+      console.warn('getAuthMethod error, defaulting to password', error);
+      return 'password';
+    }
+  }
+
+  static async getAuthValue(): Promise<string | null> {
     await this.initialize();
     try {
-      await AsyncStorage.setItem(STORAGE_KEYS.PASSWORD, password);
-      await this.updateLastSync();
+      return await AsyncStorage.getItem(STORAGE_KEYS.PASSWORD);
     } catch (error) {
-      console.error('Error setting password:', error);
-      throw new Error('Failed to set password');
+      console.error('Error reading auth value:', error);
+      return null;
     }
+  }
+
+  static async setAuthValue(value: string, method?: 'password' | 'pin' | 'pattern' | 'biometric'): Promise<void> {
+    await this.initialize();
+    try {
+      await AsyncStorage.setItem(STORAGE_KEYS.PASSWORD, value);
+      if (method) {
+        await this.updateSettings({ authMethod: method });
+      }
+      await this.updateLastSync();
+      this.emit('authUpdated');
+    } catch (error) {
+      console.error('Error setting auth value:', error);
+      throw new Error('Failed to set authentication value');
+    }
+  }
+
+  static async verifyAuthValue(candidate: string): Promise<boolean> {
+    await this.initialize();
+    try {
+      const stored = await AsyncStorage.getItem(STORAGE_KEYS.PASSWORD);
+      if (!stored) return false;
+      return stored === candidate;
+    } catch (error) {
+      console.error('Error verifying auth value:', error);
+      return false;
+    }
+  }
+
+  static async setPassword(password: string): Promise<void> {
+    await this.setAuthValue(password, 'password');
+  }
+
+  static async verifyPassword(password: string): Promise<boolean> {
+    return this.verifyAuthValue(password);
   }
 
   static async changePassword(currentPassword: string, newPassword: string): Promise<void> {
     await this.initialize();
     try {
-      // Verify current password first
-      const isCurrentValid = await this.verifyPassword(currentPassword);
+      const isCurrentValid = await this.verifyAuthValue(currentPassword);
       if (!isCurrentValid) {
         throw new Error('Current password is incorrect');
       }
-      
-      // Set new password
       await AsyncStorage.setItem(STORAGE_KEYS.PASSWORD, newPassword);
       await this.updateLastSync();
+      this.emit('authUpdated');
     } catch (error) {
       console.error('Error changing password:', error);
       throw error;
-    }
-  }
-  static async verifyPassword(password: string): Promise<boolean> {
-    await this.initialize();
-    try {
-      const storedPassword = await AsyncStorage.getItem(STORAGE_KEYS.PASSWORD);
-      return storedPassword === password;
-    } catch (error) {
-      console.error('Error verifying password:', error);
-      return false;
     }
   }
 
@@ -372,6 +547,63 @@ export class DataService {
     } catch (error) {
       console.error('Error checking password:', error);
       return false;
+    }
+  }
+
+  // -----------------------
+  // Recovery code (offline)
+  // -----------------------
+  static async generateAndStoreRecoveryCode(): Promise<string> {
+    await this.initialize();
+    try {
+      const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+      let out = '';
+      for (let i = 0; i < 12; i++) {
+        out += chars.charAt(Math.floor(Math.random() * chars.length));
+      }
+      await AsyncStorage.setItem(STORAGE_KEYS.RECOVERY_CODE, out);
+      await this.updateLastSync();
+      return out;
+    } catch (error) {
+      console.error('Error generating recovery code:', error);
+      throw new Error('Failed to generate recovery code');
+    }
+  }
+
+  static async getRecoveryCode(): Promise<string | null> {
+    await this.initialize();
+    try {
+      return await AsyncStorage.getItem(STORAGE_KEYS.RECOVERY_CODE);
+    } catch (error) {
+      console.error('Error reading recovery code:', error);
+      return null;
+    }
+  }
+
+  static async verifyRecoveryCode(code: string): Promise<boolean> {
+    await this.initialize();
+    try {
+      const stored = await AsyncStorage.getItem(STORAGE_KEYS.RECOVERY_CODE);
+      if (!stored) return false;
+      return stored === code;
+    } catch (error) {
+      console.error('Error verifying recovery code:', error);
+      return false;
+    }
+  }
+
+  static async recoverPasswordWithCode(recoveryCode: string, newPassword: string): Promise<void> {
+    await this.initialize();
+    try {
+      const stored = await AsyncStorage.getItem(STORAGE_KEYS.RECOVERY_CODE);
+      if (!stored || stored !== recoveryCode) {
+        throw new Error('Invalid recovery code');
+      }
+      await this.setAuthValue(newPassword, 'password');
+      await this.updateLastSync();
+    } catch (error) {
+      console.error('Error recovering password with code:', error);
+      throw error;
     }
   }
 
@@ -416,6 +648,10 @@ export class DataService {
       const updatedSettings = { ...currentSettings, ...settings };
       await AsyncStorage.setItem(STORAGE_KEYS.SETTINGS, JSON.stringify(updatedSettings));
       await this.updateLastSync();
+      // Emit multiple events to ensure all components update
+      this.emit('settingsUpdated');
+      this.emit('reportsUpdated');
+      this.emit('profileUpdated');
     } catch (error) {
       console.error('Error updating settings:', error);
       throw new Error('Failed to update settings');
@@ -442,15 +678,19 @@ export class DataService {
     }
   }
 
-  // Batch operations for better performance
+  // Updated: store array into DAILY_REPORTS (consistent)
   static async batchSaveReports(dailyReports: DailyReport[]): Promise<void> {
     await this.initialize();
     try {
-      const operations = dailyReports.map(report =>
-        [`@dodoma_ctf_daily_report_${report.id}`, JSON.stringify(report)] as const
-      );
-      await AsyncStorage.multiSet(operations);
+      await AsyncStorage.setItem(STORAGE_KEYS.DAILY_REPORTS, JSON.stringify(dailyReports));
       await this.updateLastSync();
+      // after bulk save, rebuild weekly reports to keep aggregates consistent
+      try {
+        await this.rebuildWeeklyReportsFromDaily();
+      } catch (err) {
+        console.warn('rebuildWeeklyReportsFromDaily failed after batchSave (non-fatal):', err);
+      }
+      this.emit('reportsUpdated');
     } catch (error) {
       console.error('Batch save error:', error);
       throw new Error('Failed to batch save reports');
@@ -486,7 +726,7 @@ export class DataService {
       let checkDate = new Date(firstUseDate);
       while (checkDate <= today) {
         const dayOfWeek = checkDate.getDay();
-        // Only check Sunday to Friday (0-5)
+        // include Sunday (0) through Friday (5)
         if (dayOfWeek >= 0 && dayOfWeek <= 5) {
           const dateString = this.getDateString(checkDate);
           if (!reportDates.has(dateString)) {
@@ -510,18 +750,15 @@ export class DataService {
     const today = new Date();
     const weekStart = this.getWeekStartDate(today);
     const dates: string[] = [];
-
-    // Sunday (0) to Friday (5) - 6 days total (indexes 0..5)
     for (let i = 0; i < 6; i++) {
       const date = new Date(weekStart);
       date.setDate(date.getDate() + i);
       const dayOfWeek = date.getDay();
-      // Only include Sunday (0) to Friday (5)
+      // include Sunday (0) through Friday (5)
       if (dayOfWeek >= 0 && dayOfWeek <= 5) {
         dates.push(this.getDateString(date));
       }
     }
-
     return dates;
   }
 
@@ -530,18 +767,24 @@ export class DataService {
   // -----------------------
   static async logout(): Promise<void> {
     try {
-      // Complete logout - clear all authentication data
+      // NOTE: Do NOT remove stored PASSWORD here — we want the login screen to still require it.
+      // Remove only transient auth counters and disable biometric so reopening forces password entry.
       await AsyncStorage.multiRemove([
-        STORAGE_KEYS.PASSWORD,
         '@auth_failed_attempts',
         '@auth_lock_until'
       ]);
-      
-      // Reset authentication state
-      await this.updateSettings({ 
-        biometricEnabled: false,
-        authMethod: 'password'
-      });
+
+      // ensure biometric is disabled and auth method set to password
+      try {
+        await this.updateSettings({
+          biometricEnabled: false,
+          authMethod: 'password'
+        });
+      } catch (e) {
+        console.warn('Could not update settings during logout', e);
+      }
+
+      this.emit('authUpdated');
     } catch (error) {
       console.error('Logout error:', error);
       throw new Error('Failed to logout');
@@ -557,11 +800,8 @@ export class DataService {
       if (!firstLoginDate) {
         const now = new Date();
         await AsyncStorage.setItem(STORAGE_KEYS.FIRST_LOGIN_DATE, now.toISOString());
-        
-        // Calculate and store current work week
         const workWeek = this.calculateCurrentWorkWeek(now);
         await AsyncStorage.setItem(STORAGE_KEYS.CURRENT_WORK_WEEK, JSON.stringify(workWeek));
-        
         return;
       }
     } catch (error) {
@@ -589,24 +829,20 @@ export class DataService {
   }
 
   private static calculateCurrentWorkWeek(date: Date): WorkWeekInfo {
-    // Find Monday of current week
-    const currentDay = date.getDay(); // 0 = Sunday, 1 = Monday, etc.
-    const daysFromMonday = currentDay === 0 ? 6 : currentDay - 1; // Sunday = 6 days from Monday
-    
-    const monday = new Date(date);
-    monday.setDate(date.getDate() - daysFromMonday);
-    monday.setHours(0, 0, 0, 0);
-    
-    // Friday at 6:00 PM
-    const friday = new Date(monday);
-    friday.setDate(monday.getDate() + 4); // Friday is 4 days after Monday
+    // Week starts Sunday (0) and ends Friday (5 at 18:00)
+    const currentDay = date.getDay(); // 0 = Sunday
+    const sunday = new Date(date);
+    sunday.setDate(date.getDate() - currentDay);
+    sunday.setHours(0, 0, 0, 0);
+
+    const friday = new Date(sunday);
+    friday.setDate(sunday.getDate() + 5);
     friday.setHours(18, 0, 0, 0);
-    
-    // Generate work days (Monday to Friday)
+
     const workDays: WorkDay[] = [];
-    for (let i = 0; i < 5; i++) {
-      const day = new Date(monday);
-      day.setDate(monday.getDate() + i);
+    for (let i = 0; i < 6; i++) {
+      const day = new Date(sunday);
+      day.setDate(sunday.getDate() + i);
       workDays.push({
         date: day.toISOString().split('T')[0],
         dayName: this.getDayName(day),
@@ -614,13 +850,13 @@ export class DataService {
         isCompleted: false
       });
     }
-    
+
     return {
-      weekStartDate: monday.toISOString().split('T')[0],
+      weekStartDate: sunday.toISOString().split('T')[0],
       weekEndDate: friday.toISOString().split('T')[0],
       workDays,
       isActive: date < friday,
-      weekNumber: this.getWeekNumber(monday)
+      weekNumber: this.getWeekNumber(sunday)
     };
   }
 
@@ -634,16 +870,12 @@ export class DataService {
     try {
       const workWeek = await this.getCurrentWorkWeek();
       if (!workWeek) return null;
-      
       const dailyReports = await this.getDailyReportsForWeek(workWeek.weekStartDate);
       const profile = await this.getUserProfile();
-      
       if (!profile) return null;
-      
       const totalHours = dailyReports.reduce((sum, r) => sum + (r.hoursWorked || 0), 0);
       const totalSales = dailyReports.reduce((sum, r) => sum + (r.dailyAmount || 0), 0);
       const totalBooks = dailyReports.reduce((sum, r) => sum + (r.booksSold || 0), 0);
-      
       return {
         studentName: profile.fullName,
         weekInfo: workWeek,
@@ -662,12 +894,13 @@ export class DataService {
       return null;
     }
   }
+
   // -----------------------
   // Utility Functions
   // -----------------------
   static getWeekStartDate(date: Date): Date {
     const day = date.getDay(); // 0 = Sunday
-    const diff = date.getDate() - day; // move back to Sunday
+    const diff = date.getDate() - day;
     const weekStart = new Date(date);
     weekStart.setDate(diff);
     weekStart.setHours(0, 0, 0, 0);
@@ -676,15 +909,15 @@ export class DataService {
 
   static getWeekEndDate(weekStart: Date): Date {
     const weekEnd = new Date(weekStart);
-    weekEnd.setDate(weekEnd.getDate() + 5); // Friday (Sunday + 5 days = Friday)
-    weekEnd.setHours(18, 0, 0, 0); // 6:00 PM
+    // Sunday start -> Friday is +5 days; set to 18:00 as requested
+    weekEnd.setDate(weekEnd.getDate() + 5);
+    weekEnd.setHours(18, 0, 0, 0);
     return weekEnd;
   }
 
   static isWeekLocked(weekStart: Date): boolean {
     const now = new Date();
     const weekEnd = this.getWeekEndDate(weekStart);
-    // Week is locked after Friday 6:00 PM
     return now >= weekEnd;
   }
 
@@ -737,7 +970,9 @@ export class DataService {
         version: CURRENT_DATA_VERSION,
       };
 
-      return JSON.stringify(exportData, null, 2);
+      const json = JSON.stringify(exportData, null, 2);
+      console.log('[DataService] exportAllData length', json.length);
+      return json;
     } catch (error) {
       throw new Error('Failed to export data');
     }
@@ -753,47 +988,53 @@ export class DataService {
         STORAGE_KEYS.WEEK_COUNTER,
       ]);
       await this.updateLastSync();
+      // Emit multiple events to ensure all components update
+      this.emit('dataCleared');
+      this.emit('reportsUpdated');
+      this.emit('profileUpdated');
+      this.emit('settingsUpdated');
     } catch (error) {
       console.error('Error clearing data:', error);
       throw new Error('Failed to clear data');
     }
   }
 
-  // Import data with validation
   static async importData(jsonData: string): Promise<void> {
     await this.initialize();
     try {
       const data = JSON.parse(jsonData);
-      
-      // Validate data structure
-      if (!data.version || !data.userProfile) {
-        throw new Error('Invalid data format');
-      }
-      
-      // Import user profile
-      if (data.userProfile) {
-        await this.saveUserProfile(data.userProfile);
-      }
-      
-      // Import reports
+      if (!data.version || !data.userProfile) throw new Error('Invalid data format');
+
+      if (data.userProfile) await this.saveUserProfile(data.userProfile);
+
       if (data.dailyReports && Array.isArray(data.dailyReports)) {
         await AsyncStorage.setItem(STORAGE_KEYS.DAILY_REPORTS, JSON.stringify(data.dailyReports));
       }
-      
+
       if (data.weeklyReports && Array.isArray(data.weeklyReports)) {
         await AsyncStorage.setItem(STORAGE_KEYS.WEEKLY_REPORTS, JSON.stringify(data.weeklyReports));
       }
-      
+
       if (data.monthlyReports && Array.isArray(data.monthlyReports)) {
         await AsyncStorage.setItem(STORAGE_KEYS.MONTHLY_REPORTS, JSON.stringify(data.monthlyReports));
       }
-      
-      // Import settings
+
       if (data.settings) {
         await this.updateSettings(data.settings);
       }
-      
+
+      // After import, rebuild weekly reports from daily to ensure consistency
+      try {
+        await this.rebuildWeeklyReportsFromDaily();
+      } catch (e) {
+        console.warn('rebuildWeeklyReportsFromDaily failed after import:', e);
+      }
+
       await this.updateLastSync();
+      // Emit multiple events to ensure all components update
+      this.emit('reportsUpdated');
+      this.emit('profileUpdated');
+      this.emit('settingsUpdated');
     } catch (error) {
       console.error('Import data error:', error);
       throw new Error('Failed to import data');
@@ -808,23 +1049,17 @@ export class DataService {
       const dailyReports = await this.getAllDailyReports();
       const reportDates = new Set(dailyReports.map(r => r.date));
       const missingDates: string[] = [];
-
-      // Check last 30 days for missing reports
       const today = new Date();
       for (let i = 1; i <= 30; i++) {
         const checkDate = new Date(today);
         checkDate.setDate(checkDate.getDate() - i);
-
-        // Only check Sunday to Friday
         const dayOfWeek = checkDate.getDay();
+        // include Sunday (0) through Friday (5)
         if (dayOfWeek >= 0 && dayOfWeek <= 5) {
           const dateString = this.getDateString(checkDate);
-          if (!reportDates.has(dateString)) {
-            missingDates.push(dateString);
-          }
+          if (!reportDates.has(dateString)) missingDates.push(dateString);
         }
       }
-
       return missingDates.sort();
     } catch (error) {
       console.error('Error getting missing dates:', error);
@@ -839,8 +1074,7 @@ export class DataService {
     try {
       const weeklyReports = await this.getAllWeeklyReports();
       const last4Weeks = weeklyReports.slice(-4);
-      const weeksCount = last4Weeks.length || 1; // avoid divide-by-zero
-
+      const weeksCount = last4Weeks.length || 1;
       return {
         averageHours: last4Weeks.reduce((sum, r) => sum + (r.totalHours || 0), 0) / weeksCount,
         averageSales: last4Weeks.reduce((sum, r) => sum + (r.totalAmount || 0), 0) / weeksCount,

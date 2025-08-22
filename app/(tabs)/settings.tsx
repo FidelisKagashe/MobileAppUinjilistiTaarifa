@@ -10,6 +10,8 @@ import {
   Switch,
   TextInput,
   ActivityIndicator,
+  BackHandler,
+  Platform,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import {
@@ -58,7 +60,6 @@ export default function SettingsScreen() {
     let unsub: (() => void) | null = null;
 
     (async () => {
-      // ensure LanguageService is initialized before we try to read translations
       try {
         await LanguageService.initialize();
       } catch (e) {
@@ -94,7 +95,6 @@ export default function SettingsScreen() {
     try {
       const settings = await DataService.getSettings();
       const profile = await DataService.getUserProfile();
-      // getCurrentTranslations is synchronous in the service, no need to await
       const trans = LanguageService.getCurrentTranslations();
 
       setTranslations(trans);
@@ -131,11 +131,13 @@ export default function SettingsScreen() {
 
         if (result.success) {
           setBiometricEnabled(true);
-          await DataService.updateSettings({ biometricEnabled: true });
+          // enable biometric and set auth method to biometric
+          await DataService.updateSettings({ biometricEnabled: true, authMethod: 'biometric' });
         }
       } else {
         setBiometricEnabled(false);
-        await DataService.updateSettings({ biometricEnabled: false });
+        // disable biometric and revert to password auth
+        await DataService.updateSettings({ biometricEnabled: false, authMethod: 'password' });
       }
     } catch (error) {
       console.error('toggleBiometric error:', error);
@@ -184,12 +186,20 @@ export default function SettingsScreen() {
           text: 'Futa Zote',
           style: 'destructive',
           onPress: async () => {
+            setLoading(true);
             try {
               await DataService.clearAllData();
+              // Also logout and force navigation to auth screen (clear stack)
+              await DataService.logout();
               Alert.alert(translations?.success ?? 'Imekamilika', translations?.dataCleared ?? 'Taarifa zote zimefutwa.');
+              // navigate to auth/login — cast to any to avoid typed-route union TS errors
+              router.dismissAll?.();
+              router.replace({ pathname: '/auth' } as any);
             } catch (error) {
               console.error('clearAllData error:', error);
               Alert.alert(translations?.error ?? 'Hitilafu', translations?.networkError ?? 'Imeshindwa kufuta taarifa.');
+            } finally {
+              setLoading(false);
             }
           },
         },
@@ -199,12 +209,15 @@ export default function SettingsScreen() {
 
   const exportData = async () => {
     try {
+      setLoading(true);
       const json = await DataService.exportAllData();
       console.log('exported data length', json.length);
       Alert.alert(translations?.success ?? 'Imekamilika!', translations?.dataExported ?? 'Taarifa zimehamishwa kikamilifu!');
     } catch (error) {
       console.error('exportData error:', error);
       Alert.alert(translations?.error ?? 'Hitilafu', translations?.networkError ?? 'Imeshindwa kuhamisha taarifa.');
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -214,7 +227,7 @@ export default function SettingsScreen() {
 
   const handlePasswordChangeSuccess = () => {
     // Optionally show success message or refresh data
-    console.log('Password changed successfully');
+    Alert.alert(translations?.success ?? 'Imefanikiwa', translations?.passwordChanged ?? 'Password imebadilishwa.');
   };
 
   const handleLogout = () => {
@@ -228,16 +241,28 @@ export default function SettingsScreen() {
           style: 'destructive',
           onPress: async () => {
             try {
+              setLoading(true);
               await DataService.logout();
-              // Force complete app restart by clearing navigation stack
-              router.dismissAll();
-              router.replace('/(tabs)');
+
+              // Exit app completely on both platforms
+              setTimeout(() => {
+                if (Platform.OS === 'android') {
+                  BackHandler.exitApp();
+                } else {
+                  // On iOS, we can't truly exit, but we can minimize
+                  // The user will need to reopen the app and authenticate
+                  router.dismissAll?.();
+                  router.replace({ pathname: '/auth' } as any);
+                }
+              }, 100);
             } catch (error) {
               console.error('logout error:', error);
               Alert.alert(
                 currentLanguage === 'sw' ? translations?.error ?? 'Hitilafu' : 'Error',
                 currentLanguage === 'sw' ? 'Imeshindwa kutoka' : 'Failed to logout'
               );
+            } finally {
+              setLoading(false);
             }
           },
         },
@@ -260,8 +285,7 @@ export default function SettingsScreen() {
     try {
       const newLang: LangKey = currentLanguage === 'sw' ? 'en' : 'sw';
       await LanguageService.setLanguage(newLang);
-      // LanguageService.subscribe will update translations and currentLanguage for us,
-      // but update local state immediately so the UI feels snappy
+      // refresh local translations/state immediately
       setCurrentLanguage(newLang);
       setTranslations(LanguageService.getCurrentTranslations());
       await DataService.updateSettings({ language: newLang });
@@ -337,7 +361,7 @@ export default function SettingsScreen() {
         {/* Header */}
         <View style={[styles.header, { backgroundColor: theme.primary }]}>
           <Text style={[styles.headerTitle, { color: theme.surface }]}>{translations.settings}</Text>
-          <Text style={[styles.headerSubtitle, { color: theme.surface + '80' }]}> 
+          <Text style={[styles.headerSubtitle, { color: theme.surface + '80' }]}>
             {currentLanguage === 'sw' ? 'Simamia mapendeleo yako na taarifa' : 'Manage your preferences and data'}
           </Text>
         </View>
@@ -512,7 +536,7 @@ export default function SettingsScreen() {
           <Text style={[styles.footerText, { color: theme.textSecondary }]}>© 2025 Kanisa la SDA - Programu ya DODOMA CTF ya Uuzaji wa Wanafunzi</Text>
         </View>
       </ScrollView>
-      
+
       <ChangePasswordModal
         visible={showChangePasswordModal}
         onClose={() => setShowChangePasswordModal(false)}

@@ -1,5 +1,5 @@
-// app/(tabs)/new-report.tsx
-import React, { useEffect, useState } from 'react';
+// (full file — replace your existing file with this)
+import React, { useEffect, useState, useRef } from 'react';
 import {
   View,
   Text,
@@ -10,6 +10,8 @@ import {
   Alert,
   KeyboardAvoidingView,
   Platform,
+  Animated,
+  Easing,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Save, Plus, Trash2, Calendar, Clock } from 'lucide-react-native';
@@ -19,7 +21,6 @@ import * as yup from 'yup';
 import { DataService } from '@/services/DataService';
 import { LanguageService } from '@/services/LanguageService';
 import { DailyReport, BookSale, UserProfile } from '@/types/Report';
-import { router } from 'expo-router';
 import { useTheme } from '../providers/ThemeProvider';
 
 // --- Defaults & validation ---
@@ -73,9 +74,17 @@ export default function NewReportScreen() {
 
   const [bookSales, setBookSales] = useState<BookSale[]>([]);
   const [loading, setLoading] = useState(false);
-  const [selectedDate, setSelectedDate] = useState<string>(new Date().toISOString().split('T')[0]);
+  const [selectedDate, setSelectedDate] = useState<string>(formatDateLocal(new Date()));
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [existingReport, setExistingReport] = useState<DailyReport | null>(null);
+
+  // book-specific inline errors keyed by book id (values may be undefined)
+  const [bookErrors, setBookErrors] = useState<Record<string, string | undefined>>({});
+
+  // toast state and animated value
+  const [toastVisible, setToastVisible] = useState(false);
+  const [toastText, setToastText] = useState('');
+  const toastAnim = useRef(new Animated.Value(-80)).current; // off-screen initially
 
   // small tick to force rerender on language change
   const [langTick, setLangTick] = useState(0);
@@ -94,16 +103,34 @@ export default function NewReportScreen() {
 
   // Initialize services on mount
   useEffect(() => {
+    let unsubLang: (() => void) | undefined;
+    let unsubReports: (() => void) | undefined;
+    let unsubProfile: (() => void) | undefined;
+    
     (async () => {
       await DataService.initialize();
       await LanguageService.initialize();
       await DataService.setFirstUseDate();
       loadUserProfile();
 
-      // subscribe to language changes to re-render UI
-      const unsubscribe = LanguageService.subscribe(() => setLangTick((t) => t + 1));
-      return unsubscribe;
+      // Subscribe to language changes to re-render UI
+      unsubLang = LanguageService.subscribe(() => setLangTick((t) => t + 1));
+      
+      // Subscribe to DataService events for live updates
+      unsubReports = DataService.subscribe('reportsUpdated', () => {
+        loadReportForDate(selectedDate);
+      });
+      
+      unsubProfile = DataService.subscribe('profileUpdated', () => {
+        loadUserProfile();
+      });
     })();
+    
+    return () => {
+      if (typeof unsubLang === 'function') unsubLang();
+      if (typeof unsubReports === 'function') unsubReports();
+      if (typeof unsubProfile === 'function') unsubProfile();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -114,8 +141,8 @@ export default function NewReportScreen() {
 
   // Recalculate totals when bookSales change
   useEffect(() => {
-    const totalAmount = bookSales.reduce((sum, sale) => sum + (sale.price || 0) * (sale.quantity || 0), 0);
-    const totalBooks = bookSales.reduce((sum, sale) => sum + (sale.quantity || 0), 0);
+    const totalAmount = bookSales.reduce((sum, sale) => sum + (Number(sale.price) || 0) * (Number(sale.quantity) || 0), 0);
+    const totalBooks = bookSales.reduce((sum, sale) => sum + (Number(sale.quantity) || 0), 0);
     setValue('dailyAmount', totalAmount);
     setValue('booksSold', totalBooks);
   }, [bookSales, setValue]);
@@ -123,6 +150,7 @@ export default function NewReportScreen() {
   const loadUserProfile = async () => {
     try {
       const profile = await DataService.getUserProfile();
+      console.log('[NewReport] loadUserProfile ->', profile);
       setUserProfile(profile);
     } catch (error) {
       console.error('Error loading user profile:', error);
@@ -131,10 +159,13 @@ export default function NewReportScreen() {
 
   const loadReportForDate = async (date: string) => {
     try {
+      console.log('[NewReport] loadReportForDate ->', date);
       const report = await DataService.getDailyReportByDate(date);
+      console.log('[NewReport] loaded report for', date, report ? 'FOUND' : 'NONE');
       if (report) {
         setExistingReport(report);
-        setBookSales(Array.isArray(report.bookSales) ? report.bookSales : []);
+        // ensure types: price/quantity are numbers
+        setBookSales(Array.isArray(report.bookSales) ? report.bookSales.map(s => ({ ...s, price: Number(s.price) || 0, quantity: Number(s.quantity) || 0 })) : []);
 
         reset({
           hoursWorked: report.hoursWorked ?? 0,
@@ -155,6 +186,8 @@ export default function NewReportScreen() {
         setBookSales([]);
         reset(DEFAULT_VALUES);
       }
+      // clear book errors when switching date
+      setBookErrors({});
     } catch (error) {
       console.error('Error loading report for date:', error);
     }
@@ -167,17 +200,99 @@ export default function NewReportScreen() {
     ]);
   };
 
-  const updateBookSale = (id: string, field: keyof BookSale, value: any) => {
-    setBookSales((prev) => prev.map((sale) => (sale.id === id ? { ...sale, [field]: value } : sale)));
+  // update price/quantity safely by parsing/cleaning the input
+  const updateBookSale = (id: string, field: keyof BookSale, rawValue: any) => {
+    setBookSales((prev) =>
+      prev.map((sale) => {
+        if (sale.id !== id) return sale;
+        let newVal: any = rawValue;
+
+        if (field === 'price') {
+          // allow digits and dot, convert to number; empty => 0
+          const cleaned = String(rawValue).replace(/[^0-9.]/g, '');
+          newVal = cleaned === '' ? 0 : parseFloat(cleaned);
+          if (Number.isNaN(newVal)) newVal = 0;
+        }
+
+        if (field === 'quantity') {
+          // allow digits only; empty => 0
+          const cleaned = String(rawValue).replace(/\D/g, '');
+          newVal = cleaned === '' ? 0 : parseInt(cleaned, 10);
+          if (Number.isNaN(newVal)) newVal = 0;
+        }
+
+        if (field === 'title') {
+          newVal = String(rawValue);
+        }
+
+        return { ...sale, [field]: newVal };
+      })
+    );
+
+    // If user updated title, remove its inline error (delete key to keep object tidy)
+    if (field === 'title') {
+      setBookErrors(prev => {
+        const copy = { ...prev };
+        delete copy[id];
+        return copy;
+      });
+    }
   };
 
   const removeBookSale = (id: string) => {
     setBookSales((prev) => prev.filter((sale) => sale.id !== id));
+    setBookErrors(prev => {
+      const copy = { ...prev };
+      delete copy[id];
+      return copy;
+    });
+  };
+
+  // show the top toast with animation
+  const showToast = (message: string) => {
+    setToastText(message);
+    setToastVisible(true);
+    // slide down
+    Animated.timing(toastAnim, {
+      toValue: 0,
+      duration: 300,
+      easing: Easing.out(Easing.ease),
+      useNativeDriver: false,
+    }).start(() => {
+      // auto-hide after 2200ms
+      setTimeout(() => {
+        Animated.timing(toastAnim, {
+          toValue: -80,
+          duration: 300,
+          easing: Easing.in(Easing.ease),
+          useNativeDriver: false,
+        }).start(() => {
+          setToastVisible(false);
+          setToastText('');
+        });
+      }, 2200);
+    });
   };
 
   const onSubmit = async (data: any) => {
     if (!userProfile) {
       Alert.alert(LanguageService.t('error'), LanguageService.t('validationError'));
+      return;
+    }
+
+    // ONLY validate book titles: if any title is empty, show short inline message (Sw/En)
+    const titleErrors: Record<string, string> = {};
+    const lang = (LanguageService.getCurrentLanguage && LanguageService.getCurrentLanguage()) || 'en';
+
+    bookSales.forEach(s => {
+      if (!s.title || !s.title.toString().trim()) {
+        titleErrors[s.id] = lang === 'sw' ? 'Jaza jina la kitabu' : 'Enter book title';
+      }
+    });
+
+    if (Object.keys(titleErrors).length > 0) {
+      setBookErrors(titleErrors);
+      // keep message short and only inline — nothing else
       return;
     }
 
@@ -198,6 +313,13 @@ export default function NewReportScreen() {
         return Number.isNaN(n) ? 0 : n;
       };
 
+      const normalizedBookSales = (Array.isArray(bookSales) ? bookSales : []).map(s => ({
+        ...s,
+        price: Number(s.price) || 0,
+        quantity: Number(s.quantity) || 0,
+        title: (s.title || '').toString().trim(),
+      }));
+
       const report: DailyReport = {
         id: existingReport?.id || `daily_${selectedDate}_${Date.now()}`,
         date: selectedDate,
@@ -215,10 +337,13 @@ export default function NewReportScreen() {
         baptismCandidates: safeNumber(data.baptismCandidates),
         baptismsPerformed: safeNumber(data.baptismsPerformed),
         peopleVisited: safeNumber(data.peopleVisited),
-        bookSales: Array.isArray(bookSales) ? bookSales : [],
+        bookSales: normalizedBookSales,
         createdAt: existingReport?.createdAt || new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
+
+      // LOG: before save
+      console.log('[NewReport] Saving report:', report);
 
       await DataService.saveDailyReport(report);
 
@@ -226,20 +351,36 @@ export default function NewReportScreen() {
       const saved = await DataService.getDailyReportByDate(selectedDate);
       if (!saved) throw new Error(LanguageService.t('networkError'));
 
-      // update UI
+      // update UI — keep the user on the same page (per your request)
       setExistingReport(saved);
-      setBookSales(Array.isArray(saved.bookSales) ? saved.bookSales : []);
+      setBookSales(Array.isArray(saved.bookSales) ? saved.bookSales.map(s => ({ ...s, price: Number(s.price) || 0, quantity: Number(s.quantity) || 0 })) : []);
+      setBookErrors({});
 
-      Alert.alert(LanguageService.t('success'), LanguageService.t('reportSaved'), [
-        {
-          text: LanguageService.t('ok'),
-          onPress: () => {
-            reset(DEFAULT_VALUES);
-            setBookSales([]);
-            router.push('/');
-          },
-        },
-      ]);
+      // EXTRA LOG: export all data (to inspect what's in AsyncStorage/localStorage)
+      try {
+        const dump = await DataService.exportAllData();
+        // print a short prefix and the length (avoid dumping huge content in Metro if very large)
+        console.log('[NewReport] DataService.exportAllData length:', dump ? dump.length : 0);
+        console.log('[NewReport] DataService.exportAllData (preview 1000 chars):', dump ? dump.substring(0, 1000) : dump);
+      } catch (e) {
+        console.warn('[NewReport] exportAllData failed', e);
+      }
+
+      // Also print weekly reports count (helpful to see if weekly calc ran)
+      try {
+        const weekly = await DataService.getAllWeeklyReports();
+        console.log('[NewReport] weeklyReports count after save:', (weekly || []).length);
+        
+        // Force refresh all related data
+        await loadReportForDate(selectedDate);
+        await loadUserProfile();
+      } catch (e) {
+        console.warn('[NewReport] getAllWeeklyReports failed', e);
+      }
+
+      // show short top toast (bilingual)
+      const toastMsg = lang === 'sw' ? 'Ripoti imehifadhiwa' : 'Report saved';
+      showToast(toastMsg);
     } catch (error: any) {
       console.error('Error saving daily report:', error);
       Alert.alert(LanguageService.t('error'), error?.message || LanguageService.t('networkError'));
@@ -248,6 +389,15 @@ export default function NewReportScreen() {
     }
   };
 
+  // Local helper: format date to YYYY-MM-DD using device local time (avoids timezone shifts)
+  function formatDateLocal(d: Date) {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  }
+
+  // Date selector: build 6-day window starting from weekStart (using DataService) but compare via local format
   const DateSelector = () => {
     const today = new Date();
     const weekStart = DataService.getWeekStartDate(today);
@@ -256,19 +406,20 @@ export default function NewReportScreen() {
     for (let i = 0; i < 6; i++) {
       const date = new Date(weekStart);
       date.setDate(date.getDate() + i);
-      const dayOfWeek = date.getDay();
-      if (dayOfWeek >= 0 && dayOfWeek <= 5) dates.push(date);
+      dates.push(date);
     }
+
+    const localTodayStr = formatDateLocal(new Date());
 
     return (
       <View style={styles.dateSelector}>
         <Text style={[styles.dateSelectorTitle, { color: theme.text }]}>{LanguageService.t('selectDay')}</Text>
         <ScrollView horizontal showsHorizontalScrollIndicator={false}>
           {dates.map((date) => {
-            const dateString = date.toISOString().split('T')[0];
+            const dateString = formatDateLocal(date);
             const isSelected = dateString === selectedDate;
             const dayName = LanguageService.getDayName(date);
-            const isToday = dateString === new Date().toISOString().split('T')[0];
+            const isToday = dateString === localTodayStr;
             return (
               <TouchableOpacity
                 key={dateString}
@@ -317,11 +468,42 @@ export default function NewReportScreen() {
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
+      {/* Top toast (absolute) */}
+      <Animated.View
+        style={[
+          styles.toast,
+          { backgroundColor: theme.success, transform: [{ translateY: toastAnim }] },
+          // keep above everything
+          { zIndex: 1000 },
+        ]}
+        pointerEvents="none"
+      >
+        <Text style={[styles.toastText, { color: '#fff' }]} numberOfLines={1}>{toastText}</Text>
+      </Animated.View>
+
       <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={styles.keyboardAvoid}>
         <ScrollView showsVerticalScrollIndicator={false}>
           <View style={[styles.header, { backgroundColor: theme.primary }]}>
             <Text style={[styles.headerTitle, { color: theme.surface }]}>{LanguageService.t('dailyReport')}</Text>
             <Text style={[styles.headerSubtitle, { color: theme.surface + 'cc' }]}>{existingReport ? LanguageService.t('updateReport') : LanguageService.t('saveReport')}</Text>
+
+            {/* DEBUG button — temporary: prints exportAllData() to console */}
+            <TouchableOpacity
+              onPress={async () => {
+                try {
+                  const dump = await DataService.exportAllData();
+                  console.log('[NewReport DEBUG EXPORT] length:', dump ? dump.length : 0);
+                  console.log('[NewReport DEBUG EXPORT preview]', dump ? dump.substring(0, 2000) : dump);
+                  Alert.alert('Debug', 'Exported JSON logged to console (Metro / DevTools).');
+                } catch (e) {
+                  console.error('[NewReport DEBUG] export failed', e);
+                  Alert.alert('Debug', 'Export failed: see console');
+                }
+              }}
+              style={{ position: 'absolute', right: 16, top: Platform.OS === 'ios' ? 64 : 24 }}
+            >
+              <Text style={{ color: theme.surface, fontWeight: '600' }}>Debug</Text>
+            </TouchableOpacity>
           </View>
 
           <View style={styles.formContainer}>
@@ -367,19 +549,32 @@ export default function NewReportScreen() {
                     value={sale.title}
                     onChangeText={(text) => updateBookSale(sale.id, 'title', text)}
                   />
+                  {bookErrors[sale.id] ? <Text style={[styles.errorText, { color: theme.error }]}>{bookErrors[sale.id]}</Text> : null}
 
                   <View style={styles.bookSaleRow}>
                     <View style={styles.bookSaleField}>
                       <Text style={[styles.inputLabel, { color: theme.text }]}>{LanguageService.t('price')}</Text>
-                      <TextInput style={[styles.input, { backgroundColor: theme.card, borderColor: theme.border, color: theme.text }]} placeholder="0" keyboardType="numeric" value={sale.price?.toString()} onChangeText={(text) => updateBookSale(sale.id, 'price', parseFloat(text) || 0)} />
+                      <TextInput
+                        style={[styles.input, { backgroundColor: theme.card, borderColor: theme.border, color: theme.text }]}
+                        placeholder="0"
+                        keyboardType="numeric"
+                        value={String(sale.price ?? 0)}
+                        onChangeText={(text) => updateBookSale(sale.id, 'price', text)}
+                      />
                     </View>
                     <View style={styles.bookSaleField}>
                       <Text style={[styles.inputLabel, { color: theme.text }]}>{LanguageService.t('quantity')}</Text>
-                      <TextInput style={[styles.input, { backgroundColor: theme.card, borderColor: theme.border, color: theme.text }]} placeholder="1" keyboardType="numeric" value={sale.quantity?.toString()} onChangeText={(text) => updateBookSale(sale.id, 'quantity', parseInt(text) || 1)} />
+                      <TextInput
+                        style={[styles.input, { backgroundColor: theme.card, borderColor: theme.border, color: theme.text }]}
+                        placeholder="1"
+                        keyboardType="numeric"
+                        value={String(sale.quantity ?? 0)}
+                        onChangeText={(text) => updateBookSale(sale.id, 'quantity', text)}
+                      />
                     </View>
                   </View>
 
-                  <Text style={[styles.bookSaleTotal, { color: theme.success }]}>{LanguageService.t('total')}: TSH {((sale.price || 0) * (sale.quantity || 0)).toLocaleString()}</Text>
+                  <Text style={[styles.bookSaleTotal, { color: theme.success }]}>{LanguageService.t('total')}: TSH {((Number(sale.price) || 0) * (Number(sale.quantity) || 0)).toLocaleString()}</Text>
                 </View>
               ))}
 
@@ -468,4 +663,21 @@ const styles = StyleSheet.create({
   autoSaveText: { fontSize: 14, marginLeft: 8, flex: 1 },
   submitButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', padding: 16, borderRadius: 12, marginTop: 24, marginBottom: 32 },
   submitButtonText: { fontSize: 16, fontWeight: '600', marginLeft: 8 },
+
+  /* toast */
+  toast: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    height: 56,
+    paddingHorizontal: 16,
+    justifyContent: 'center',
+    elevation: 6,
+    shadowColor: '#000',
+    shadowOpacity: 0.15,
+    shadowOffset: { width: 0, height: 2 },
+    shadowRadius: 6,
+  },
+  toastText: { fontSize: 14, fontWeight: '600' },
 });
